@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 import sys
+import os
+import configparser
+import threading
+import time
+from datetime import datetime
 from PyQt5.QtWidgets import *
+from PyQt5.QtCore import QTimer
 from CamOperation_class import CameraOperation
 from MvCameraControl_class import *
 from MvErrorDefine_const import *
@@ -52,6 +58,14 @@ if __name__ == "__main__":
     isGrabbing = False
     global isCalibMode  # 是否是标定模式（获取原始图像）
     isCalibMode = True
+    global save_path
+    save_path = ""  # 空字符串表示使用脚本所在目录作为默认路径
+    global auto_capture_running
+    auto_capture_running = False
+
+    # 脚本所在目录作为默认保存路径
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    SETTINGS_FILE = os.path.join(SCRIPT_DIR, "setting.ini")
 
     # 绑定下拉列表至设备信息索引
     def xFunc(event):
@@ -288,7 +302,94 @@ if __name__ == "__main__":
             QMessageBox.warning(mainWindow, "Error", strError, QMessageBox.Ok)
         else:
             print("Save image success")
-            
+
+    # ---- 设置读写 ----
+    def load_settings():
+        """从 setting.ini 读取保存路径设置"""
+        global save_path
+        config = configparser.ConfigParser()
+        if os.path.exists(SETTINGS_FILE):
+            config.read(SETTINGS_FILE, encoding='utf-8')
+            save_path = config.get('Settings', 'save_path', fallback='')
+        else:
+            save_path = ''
+        _update_path_label()
+        print("Settings loaded. Save path: '{}'".format(save_path or SCRIPT_DIR))
+
+    def save_settings():
+        """将保存路径写入 setting.ini"""
+        config = configparser.ConfigParser()
+        config['Settings'] = {'save_path': save_path}
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            config.write(f)
+        print("Settings saved. Save path: '{}'".format(save_path))
+
+    def _update_path_label():
+        """刷新界面上的路径提示标签"""
+        effective = save_path if save_path else SCRIPT_DIR
+        ui.lblSavePathInfo.setText("保存至: " + effective)
+
+    def get_effective_save_path():
+        """返回实际使用的保存目录"""
+        return save_path if save_path else SCRIPT_DIR
+
+    def set_save_path():
+        """打开文件夹选择对话框，保存选中路径到 setting.ini"""
+        global save_path
+        new_path = QFileDialog.getExistingDirectory(
+            mainWindow, "选择图片保存路径", get_effective_save_path())
+        if new_path:
+            save_path = new_path
+            save_settings()
+            _update_path_label()
+
+    # ---- 自动拍摄 ----
+    def _auto_capture_worker(count):
+        """后台线程：连续拍摄 count 张图片并保存"""
+        global auto_capture_running
+        save_dir = get_effective_save_path()
+        os.makedirs(save_dir, exist_ok=True)
+        success_count = 0
+        timestamp_base = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        for i in range(count):
+            if not auto_capture_running:
+                break
+            file_name = "{}_{:03d}.bmp".format(timestamp_base, i + 1)
+            full_path = os.path.join(save_dir, file_name)
+            try:
+                ret = obj_cam_operation.Save_Bmp_with_path(full_path)
+                if ret == MV_OK:
+                    success_count += 1
+                    print("Auto capture [{}/{}]: {}".format(i + 1, count, full_path))
+                else:
+                    print("Auto capture [{}/{}] failed, ret: {}".format(
+                        i + 1, count, ToHexStr(ret)))
+            except Exception as e:
+                print("Auto capture [{}/{}] error: {}".format(i + 1, count, str(e)))
+            # 等待一小段时间以获取不同帧
+            time.sleep(0.2)
+
+        auto_capture_running = False
+        msg = "自动拍摄完成！成功保存 {}/{} 张图片\n保存路径: {}".format(
+            success_count, count, save_dir)
+        QTimer.singleShot(0, lambda: QMessageBox.information(mainWindow, "完成", msg))
+
+    def start_auto_capture():
+        """检查输入并启动自动拍摄线程"""
+        global auto_capture_running
+        if auto_capture_running:
+            QMessageBox.warning(mainWindow, "提示", "自动拍摄正在进行中！", QMessageBox.Ok)
+            return
+        count_str = ui.edtCaptureCount.text().strip()
+        if not count_str.isdigit() or int(count_str) <= 0:
+            QMessageBox.warning(mainWindow, "错误", "请输入正整数！", QMessageBox.Ok)
+            return
+        count = int(count_str)
+        auto_capture_running = True
+        t = threading.Thread(target=_auto_capture_worker, args=(count,), daemon=True)
+        t.start()
+
     def is_float(str):
         try:
             float(str)
@@ -343,6 +444,7 @@ if __name__ == "__main__":
         ui.bnSoftwareTrigger.setEnabled(isGrabbing and ui.radioTriggerMode.isChecked())
 
         ui.bnSaveImage.setEnabled(isOpen and isGrabbing)
+        ui.bnAutoCapture.setEnabled(isOpen and isGrabbing)
 
     # ch: 初始化app, 绑定控件与函数 | en: Init app, bind ui and api
     app = QApplication(sys.argv)
@@ -363,7 +465,10 @@ if __name__ == "__main__":
     ui.bnSetParam.clicked.connect(set_param)
 
     ui.bnSaveImage.clicked.connect(save_bmp)
+    ui.bnAutoCapture.clicked.connect(start_auto_capture)
+    ui.bnSetSavePath.clicked.connect(set_save_path)
 
+    load_settings()
     mainWindow.show()
 
     app.exec_()
