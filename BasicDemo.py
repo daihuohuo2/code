@@ -520,6 +520,47 @@ if __name__ == "__main__":
             except serial.SerialException as e:
                 QMessageBox.warning(mainWindow, "串口错误",
                                     "无法打开串口:\n" + str(e), QMessageBox.Ok)
+
+    # ---- G-code 发送 ----
+    def send_gcode(cmd):
+        """通用 G-code 发送函数：检查连接状态后将命令编码发送至串口"""
+        if not is_serial_connected or serial_conn is None:
+            QMessageBox.warning(mainWindow, "错误",
+                                "串口未连接，请先连接串口！", QMessageBox.Ok)
+            return False
+        try:
+            serial_conn.write(cmd.encode('utf-8'))
+            print("已发送 G-code: {}".format(cmd.strip()))
+            return True
+        except Exception as e:
+            QMessageBox.warning(mainWindow, "串口错误",
+                                "发送失败:\n" + str(e), QMessageBox.Ok)
+            return False
+
+    def action_home_z():
+        """Z 轴归零：发送 G28 Z"""
+        send_gcode("G28 Z\n")
+
+    def action_move_z_step():
+        """Z 轴微调（相对运动 0.1mm）"""
+        if send_gcode("G91\n"):
+            send_gcode("G1 Z0.1 F300\n")
+            send_gcode("G90\n")
+
+    def action_set_light():
+        """亮度控制（PWM）：读取 edtLightValue 并发送 M106 S{value}"""
+        value_str = ui.edtLightValue.text().strip()
+        if not value_str.isdigit():
+            QMessageBox.warning(mainWindow, "错误",
+                                "请输入 0-255 之间的整数！", QMessageBox.Ok)
+            return
+        value = int(value_str)
+        if not (0 <= value <= 255):
+            QMessageBox.warning(mainWindow, "错误",
+                                "亮度值必须在 0-255 范围内！", QMessageBox.Ok)
+            return
+        send_gcode("M106 S{}\n".format(value))
+
     def get_param():
         ret = obj_cam_operation.Get_parameter()
         if ret != MV_OK:
@@ -590,6 +631,9 @@ if __name__ == "__main__":
     ui.bnSetSavePath.clicked.connect(set_save_path)
     ui.bnRefreshPort.clicked.connect(refresh_serial_ports)
     ui.bnConnectSerial.clicked.connect(connect_serial)
+    ui.bnHomeZ.clicked.connect(action_home_z)
+    ui.bnMoveStep.clicked.connect(action_move_z_step)
+    ui.bnSetLight.clicked.connect(action_set_light)
 
     load_settings()
     mainWindow.show()
