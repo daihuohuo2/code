@@ -387,3 +387,27 @@ class CameraOperation:
         self.buf_lock.release()
 
         return ret
+
+    # 存BMP图像到指定完整路径
+    def Save_Bmp_with_path(self, full_path):
+        if self.buf_save_image is None or self.buf_save_image_len == 0:
+            return MV_E_RESOURCE
+
+        # 获取缓存锁
+        self.buf_lock.acquire()
+        try:
+            # 使用 gbk 编码以支持中文路径（Windows 环境）
+            c_file_path = full_path.encode('gbk', errors='replace')
+            stSaveParam = MV_SAVE_IMAGE_TO_FILE_PARAM_EX()
+            stSaveParam.enPixelType = self.st_frame_info.enPixelType
+            stSaveParam.nWidth = self.st_frame_info.nWidth
+            stSaveParam.nHeight = self.st_frame_info.nHeight
+            stSaveParam.nDataLen = self.st_frame_info.nFrameLen
+            stSaveParam.pData = cast(self.buf_save_image, POINTER(c_ubyte))
+            stSaveParam.enImageType = MV_Image_Bmp
+            stSaveParam.pcImagePath = ctypes.create_string_buffer(c_file_path)
+            stSaveParam.iMethodValue = 1
+            ret = self.obj_cam.MV_CC_SaveImageToFileEx(stSaveParam)
+        finally:
+            self.buf_lock.release()
+        return ret

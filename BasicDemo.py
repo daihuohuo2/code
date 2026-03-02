@@ -5,6 +5,13 @@ import configparser
 import threading
 import time
 from datetime import datetime
+try:
+    import serial
+    import serial.tools.list_ports
+    _SERIAL_AVAILABLE = True
+except ImportError:
+    _SERIAL_AVAILABLE = False
+    print("[Warning] pyserial 未安装，串口功能不可用。请执行: pip install pyserial")
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import QTimer
 from CamOperation_class import CameraOperation
@@ -62,6 +69,10 @@ if __name__ == "__main__":
     save_path = ""  # 空字符串表示使用脚本所在目录作为默认路径
     global auto_capture_running
     auto_capture_running = False
+    global serial_conn
+    serial_conn = None
+    global is_serial_connected
+    is_serial_connected = False
 
     # 脚本所在目录作为默认保存路径
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -305,21 +316,47 @@ if __name__ == "__main__":
 
     # ---- 设置读写 ----
     def load_settings():
-        """从 setting.ini 读取保存路径设置"""
+        """从 setting.ini 读取保存路径及串口设置"""
         global save_path
         config = configparser.ConfigParser()
         if os.path.exists(SETTINGS_FILE):
             config.read(SETTINGS_FILE, encoding='utf-8')
             save_path = config.get('Settings', 'save_path', fallback='')
+            saved_baud    = config.get('Serial', 'baud_rate', fallback='115200')
+            saved_timeout = config.get('Serial', 'timeout',   fallback='1.0')
+            saved_port    = config.get('Serial', 'port',      fallback='')
         else:
-            save_path = ''
+            save_path     = ''
+            saved_baud    = '115200'
+            saved_timeout = '1.0'
+            saved_port    = ''
         _update_path_label()
+        # 填充波特率下拉列表
+        baud_rates = ['9600', '19200', '38400', '57600', '115200', '230400', '460800', '921600']
+        ui.cmbBaudRate.clear()
+        ui.cmbBaudRate.addItems(baud_rates)
+        idx = ui.cmbBaudRate.findText(saved_baud)
+        ui.cmbBaudRate.setCurrentIndex(idx if idx >= 0 else baud_rates.index('115200'))
+        # 填充超时
+        ui.edtSerialTimeout.setText(saved_timeout)
+        # 初始化可用串口并尝试恢复上次选择
+        refresh_serial_ports()
+        if saved_port:
+            idx_port = ui.cmbSerialPort.findText(saved_port)
+            if idx_port >= 0:
+                ui.cmbSerialPort.setCurrentIndex(idx_port)
+        _update_serial_status()
         print("Settings loaded. Save path: '{}'".format(save_path or SCRIPT_DIR))
 
     def save_settings():
-        """将保存路径写入 setting.ini"""
+        """将保存路径及串口设置写入 setting.ini"""
         config = configparser.ConfigParser()
         config['Settings'] = {'save_path': save_path}
+        config['Serial'] = {
+            'port':      ui.cmbSerialPort.currentText() if ui.cmbSerialPort.count() > 0 else '',
+            'baud_rate': ui.cmbBaudRate.currentText(),
+            'timeout':   ui.edtSerialTimeout.text().strip(),
+        }
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
             config.write(f)
         print("Settings saved. Save path: '{}'".format(save_path))
@@ -396,9 +433,93 @@ if __name__ == "__main__":
             return True
         except ValueError:
             return False
-    
 
-    # ch: 获取参数 | en:get param
+    # ---- 串口功能 ----
+    def refresh_serial_ports():
+        """扫描系统可用串口并刷新下拉列表"""
+        if not _SERIAL_AVAILABLE:
+            ui.cmbSerialPort.clear()
+            ui.cmbSerialPort.addItem("pyserial 未安装")
+            return
+        current = ui.cmbSerialPort.currentText()
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        ui.cmbSerialPort.clear()
+        if ports:
+            ui.cmbSerialPort.addItems(ports)
+            idx = ui.cmbSerialPort.findText(current)
+            if idx >= 0:
+                ui.cmbSerialPort.setCurrentIndex(idx)
+        else:
+            ui.cmbSerialPort.addItem("无可用串口")
+        print("已刷新串口列表: {}".format(ports if ports else "无"))
+
+    def _update_serial_status():
+        """根据连接状态更新状态标签样式"""
+        if is_serial_connected:
+            ui.lblSerialStatus.setText("● 已连接")
+            ui.lblSerialStatus.setStyleSheet("color: green; font-weight: bold;")
+            ui.bnConnectSerial.setText("断开串口")
+        else:
+            ui.lblSerialStatus.setText("● 未连接")
+            ui.lblSerialStatus.setStyleSheet("color: red; font-weight: bold;")
+            ui.bnConnectSerial.setText("连接串口")
+
+    def connect_serial():
+        """切换串口连接状态（连接/断开）"""
+        global serial_conn, is_serial_connected
+        if not _SERIAL_AVAILABLE:
+            QMessageBox.warning(mainWindow, "错误",
+                                "pyserial 未安装，请执行:\npip install pyserial",
+                                QMessageBox.Ok)
+            return
+
+        if is_serial_connected:
+            # 断开连接
+            try:
+                serial_conn.close()
+            except Exception:
+                pass
+            serial_conn = None
+            is_serial_connected = False
+            _update_serial_status()
+            save_settings()
+            print("串口已断开")
+        else:
+            # 建立连接
+            port = ui.cmbSerialPort.currentText()
+            if not port or port in ("无可用串口", "pyserial 未安装"):
+                QMessageBox.warning(mainWindow, "错误",
+                                    "请先选择有效的串口！", QMessageBox.Ok)
+                return
+            baud_str    = ui.cmbBaudRate.currentText()
+            timeout_str = ui.edtSerialTimeout.text().strip()
+            try:
+                baud = int(baud_str)
+            except ValueError:
+                QMessageBox.warning(mainWindow, "错误", "波特率格式不正确！", QMessageBox.Ok)
+                return
+            try:
+                timeout = float(timeout_str)
+            except ValueError:
+                QMessageBox.warning(mainWindow, "错误",
+                                    "超时时间格式不正确，请输入数字！", QMessageBox.Ok)
+                return
+            try:
+                serial_conn = serial.Serial(
+                    port=port,
+                    baudrate=baud,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=timeout
+                )
+                is_serial_connected = True
+                _update_serial_status()
+                save_settings()
+                print("串口已连接: {} @ {} baud, timeout={}s".format(port, baud, timeout))
+            except serial.SerialException as e:
+                QMessageBox.warning(mainWindow, "串口错误",
+                                    "无法打开串口:\n" + str(e), QMessageBox.Ok)
     def get_param():
         ret = obj_cam_operation.Get_parameter()
         if ret != MV_OK:
@@ -467,6 +588,8 @@ if __name__ == "__main__":
     ui.bnSaveImage.clicked.connect(save_bmp)
     ui.bnAutoCapture.clicked.connect(start_auto_capture)
     ui.bnSetSavePath.clicked.connect(set_save_path)
+    ui.bnRefreshPort.clicked.connect(refresh_serial_ports)
+    ui.bnConnectSerial.clicked.connect(connect_serial)
 
     load_settings()
     mainWindow.show()
@@ -474,6 +597,14 @@ if __name__ == "__main__":
     app.exec_()
 
     close_device()
+
+    # 关闭串口
+    if is_serial_connected and serial_conn is not None:
+        try:
+            serial_conn.close()
+            print("退出时已自动关闭串口")
+        except Exception:
+            pass
 
     # ch:反初始化SDK | en: finalize SDK
     MvCamera.MV_CC_Finalize()
