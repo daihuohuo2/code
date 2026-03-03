@@ -69,6 +69,8 @@ if __name__ == "__main__":
     save_path = ""  # 空字符串表示使用脚本所在目录作为默认路径
     global auto_capture_running
     auto_capture_running = False
+    global autofocus_running
+    autofocus_running = False
     global serial_conn
     serial_conn = None
     global is_serial_connected
@@ -434,7 +436,202 @@ if __name__ == "__main__":
         except ValueError:
             return False
 
-    # ---- 串口功能 ----
+    # ---- 自动对焦（对比度解析 + 混合PID）----
+    def _compute_sharpness():
+        """计算当前帧的锏度分数：拉普拉斯方差 + Tenengrad 加权平均"""
+        try:
+            import numpy as np
+            data, w, h = obj_cam_operation.Get_frame_numpy()
+            if data is None or w == 0 or h == 0:
+                return 0.0
+            # 只取前 w*h 字节（Mono8 / Bayer8 均适用）
+            if len(data) < w * h:
+                return 0.0
+            gray = data[:w * h].reshape(h, w).astype(np.float32)
+            # Tenengrad（简化 Sobel）
+            dx = gray[:, 1:] - gray[:, :-1]
+            dy = gray[1:, :] - gray[:-1, :]
+            tenengrad = float(np.mean(dx ** 2) + np.mean(dy ** 2))
+            # 拉普拉斯方差
+            lap = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
+                   gray[1:-1, :-2] + gray[1:-1, 2:] -
+                   4 * gray[1:-1, 1:-1])
+            lap_var = float(np.var(lap))
+            return 0.5 * tenengrad + 0.5 * lap_var
+        except Exception as e:
+            print("[AF] 锏度计算异常:", e)
+            return 0.0
+
+    def _af_move_z(step_mm):
+        """相对移动 Z 轴 step_mm 毫米，返回是否成功"""
+        if not send_gcode("G91\n"):
+            return False
+        if not send_gcode("G1 Z{:.4f} F300\n".format(step_mm)):
+            return False
+        if not send_gcode("G90\n"):
+            return False
+        time.sleep(0.25)
+        return True
+
+    def _autofocus_worker():
+        """
+        自动对焦后台线程：
+          Phase 1 — 粗搜索：大步长扫描找到大致最优位置
+          Phase 2 — 中等精度搜索：缩小范围细化
+          Phase 3 — 混合 PID：寻找锏度梯度为零的位置
+        """
+        global autofocus_running
+
+        def set_status(msg):
+            QTimer.singleShot(0, lambda: ui.lblAutoFocusStatus.setText(msg))
+
+        try:
+            set_status("对焦中… 粗搜索")
+            print("[AF] ===== 开始自动对焦 =====")
+
+            # ----------------------------------------
+            # Phase 1: 粗搜索  ±3mm 步长 1mm
+            # ----------------------------------------
+            COARSE_STEP = 1.0
+            COARSE_HALF = 3
+            current_pos = 0.0
+
+            if not _af_move_z(-COARSE_STEP * COARSE_HALF):
+                set_status("对焦失败：串口错误")
+                return
+            current_pos = -COARSE_STEP * COARSE_HALF
+
+            scores_c, pos_c = [], []
+            total_c = COARSE_HALF * 2 + 1
+            for i in range(total_c):
+                if not autofocus_running:
+                    set_status("已停止")
+                    return
+                time.sleep(0.15)
+                s = _compute_sharpness()
+                scores_c.append(s)
+                pos_c.append(current_pos)
+                print("[AF]粗搜索 pos={:.1f}mm s={:.1f}".format(current_pos, s))
+                set_status("对焦中… 粗搜索 {}/{}".format(i + 1, total_c))
+                if i < total_c - 1:
+                    _af_move_z(COARSE_STEP)
+                    current_pos += COARSE_STEP
+
+            best_c = int(max(range(len(scores_c)), key=lambda k: scores_c[k]))
+            best_pos = pos_c[best_c]
+            print("[AF]粗搜索最佳: {:.1f}mm  s={:.1f}".format(best_pos, scores_c[best_c]))
+            _af_move_z(best_pos - current_pos)
+            current_pos = best_pos
+
+            # ----------------------------------------
+            # Phase 2: 中等搜索  ±0.8mm 步长 0.2mm
+            # ----------------------------------------
+            set_status("对焦中… 中等搜索")
+            MEDIUM_STEP = 0.2
+            MEDIUM_HALF = 4
+            _af_move_z(-MEDIUM_STEP * MEDIUM_HALF)
+            current_pos -= MEDIUM_STEP * MEDIUM_HALF
+
+            scores_m, pos_m = [], []
+            total_m = MEDIUM_HALF * 2 + 1
+            for i in range(total_m):
+                if not autofocus_running:
+                    set_status("已停止")
+                    return
+                time.sleep(0.12)
+                s = _compute_sharpness()
+                scores_m.append(s)
+                pos_m.append(current_pos)
+                print("[AF]中等搜索 pos={:.2f}mm s={:.1f}".format(current_pos, s))
+                set_status("对焦中… 中等搜索 {}/{}".format(i + 1, total_m))
+                if i < total_m - 1:
+                    _af_move_z(MEDIUM_STEP)
+                    current_pos += MEDIUM_STEP
+
+            best_m = int(max(range(len(scores_m)), key=lambda k: scores_m[k]))
+            best_pos = pos_m[best_m]
+            print("[AF]中等搜索最佳: {:.2f}mm  s={:.1f}".format(best_pos, scores_m[best_m]))
+            _af_move_z(best_pos - current_pos)
+            current_pos = best_pos
+
+            # ----------------------------------------
+            # Phase 3: 混合 PID 精细调节
+            #  误差 = 锏度梯度（如在最佳点，梯度=0）
+            # ----------------------------------------
+            set_status("对焦中… PID 精细")
+            print("[AF] PID 精细开始")
+            Kp, Ki, Kd = 0.06, 0.004, 0.018
+            integral = 0.0
+            prev_error = 0.0
+            PROBE = 0.05        # 探测步长 mm
+            MAX_ITER = 20
+            CONV_THR = 0.004    # 步长小于此值则认为收敛
+
+            for it in range(MAX_ITER):
+                if not autofocus_running:
+                    break
+                # 正向探测
+                _af_move_z(PROBE)
+                current_pos += PROBE
+                time.sleep(0.1)
+                s_plus = _compute_sharpness()
+                # 负向探测
+                _af_move_z(-2 * PROBE)
+                current_pos -= 2 * PROBE
+                time.sleep(0.1)
+                s_minus = _compute_sharpness()
+                # 回到中间
+                _af_move_z(PROBE)
+                current_pos += PROBE
+
+                gradient = (s_plus - s_minus) / (2 * PROBE)
+                error = gradient
+                integral = max(-0.5, min(0.5, integral + error * 0.01))
+                derivative = error - prev_error
+                control = Kp * error + Ki * integral + Kd * derivative
+                step = max(-0.15, min(0.15, control))
+                print("[AF] PID迭 {}: grad={:.1f} step={:.4f}mm".format(it + 1, gradient, step))
+
+                prev_error = error
+                if abs(step) < CONV_THR:
+                    print("[AF] PID 收敛!")
+                    break
+                _af_move_z(step)
+                current_pos += step
+
+            s_final = _compute_sharpness()
+            print("[AF] ===== 对焦完成 最终锏度={:.1f} =====".format(s_final))
+            set_status("对焦完成 \u2713  锏度:{:.0f}".format(s_final))
+
+        except Exception as e:
+            print("[AF] 异常:", e)
+            set_status("对焦失败: " + str(e))
+        finally:
+            autofocus_running = False
+            QTimer.singleShot(0, lambda: ui.bnAutoFocus.setEnabled(True))
+            QTimer.singleShot(0, lambda: ui.bnStopAutoFocus.setEnabled(False))
+
+    def start_autofocus():
+        """启动自动对焦线程"""
+        global autofocus_running
+        if not is_serial_connected:
+            QMessageBox.warning(mainWindow, "错误", "请先连接串口！", QMessageBox.Ok)
+            return
+        if autofocus_running:
+            QMessageBox.warning(mainWindow, "提示", "对焦正在进行！", QMessageBox.Ok)
+            return
+        autofocus_running = True
+        ui.bnAutoFocus.setEnabled(False)
+        ui.bnStopAutoFocus.setEnabled(True)
+        t = threading.Thread(target=_autofocus_worker, daemon=True)
+        t.start()
+
+    def stop_autofocus():
+        """请求停止对焦"""
+        global autofocus_running
+        autofocus_running = False
+        ui.lblAutoFocusStatus.setText("停止中…")
+
     def refresh_serial_ports():
         """扫描系统可用串口并刷新下拉列表"""
         if not _SERIAL_AVAILABLE:
@@ -607,6 +804,8 @@ if __name__ == "__main__":
 
         ui.bnSaveImage.setEnabled(isOpen and isGrabbing)
         ui.bnAutoCapture.setEnabled(isOpen and isGrabbing)
+        ui.bnAutoFocus.setEnabled(isOpen and isGrabbing and not autofocus_running)
+        ui.bnStopAutoFocus.setEnabled(autofocus_running)
 
     # ch: 初始化app, 绑定控件与函数 | en: Init app, bind ui and api
     app = QApplication(sys.argv)
@@ -629,6 +828,8 @@ if __name__ == "__main__":
     ui.bnSaveImage.clicked.connect(save_bmp)
     ui.bnAutoCapture.clicked.connect(start_auto_capture)
     ui.bnSetSavePath.clicked.connect(set_save_path)
+    ui.bnAutoFocus.clicked.connect(start_autofocus)
+    ui.bnStopAutoFocus.clicked.connect(stop_autofocus)
     ui.bnRefreshPort.clicked.connect(refresh_serial_ports)
     ui.bnConnectSerial.clicked.connect(connect_serial)
     ui.bnHomeZ.clicked.connect(action_home_z)

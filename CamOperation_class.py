@@ -388,6 +388,31 @@ class CameraOperation:
 
         return ret
 
+    # 获取当前帧的 numpy 数组副本（用于锐度计算）
+    def Get_frame_numpy(self):
+        """
+        返回当前帧的 numpy uint8 一维数组副本及宽高。
+        返回值: (data: ndarray | None, width: int, height: int)
+        对于 Mono8/BayerXX8 图像，data 长度 = width * height。
+        """
+        if self.buf_save_image is None or self.buf_save_image_len == 0:
+            return None, 0, 0
+        self.buf_lock.acquire()
+        try:
+            import numpy as np
+            w = self.st_frame_info.nWidth
+            h = self.st_frame_info.nHeight
+            frame_len = self.st_frame_info.nFrameLen
+            # 将 ctypes 缓冲复制到 numpy 数组
+            raw = (c_ubyte * frame_len).from_buffer_copy(self.buf_save_image)
+            data = np.frombuffer(raw, dtype=np.uint8).copy()
+            return data, w, h
+        except Exception as e:
+            print("[Get_frame_numpy] error:", e)
+            return None, 0, 0
+        finally:
+            self.buf_lock.release()
+
     # 存BMP图像到指定完整路径
     def Save_Bmp_with_path(self, full_path):
         if self.buf_save_image is None or self.buf_save_image_len == 0:
