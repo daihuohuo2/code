@@ -13,7 +13,7 @@ except ImportError:
     _SERIAL_AVAILABLE = False
     print("[Warning] pyserial 未安装，串口功能不可用。请执行: pip install pyserial")
 from PyQt5.QtWidgets import *
-from PyQt5.QtCore import QTimer, QObject, QEvent, Qt
+from PyQt5.QtCore import QTimer, QObject, QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont
 from CamOperation_class import CameraOperation
 from MvCameraControl_class import *
@@ -664,6 +664,627 @@ class PointCloudReconDialog(QDialog):
             QMessageBox.warning(self, "导出错误", str(e))
 
 
+# ──────────────────────────────────────────────────────────────────
+#  以时间换位深度（嵌套叠叠乐）— 连续扫描 + 时间映射 Z 位置
+# ──────────────────────────────────────────────────────────────────
+
+class TemporalDepthDialog(QDialog):
+    """
+    以时间换位深度 对话框（嵌套叠叠乐算法）
+
+    核心思路：
+      与传统"停-拍-移"DFF 不同，本方法让 Z 轴做 **匀速连续运动**，
+      相机同时以固定间隔持续采帧，每帧的 Z 位置由
+          z(t) = z_start + speed × elapsed_time
+      推算，不需要串口应答轮询。
+      采集结束后可选择 **嵌套精扫**（Nested Pass）：
+        自动在粗扫的最佳焦深区间内以更低速度/更密采样再做一次，
+        将两轮数据叠加融合，层层叠加，逐步提升深度精度——
+        这正是"叠叠乐"（嵌套 Jenga 积木）的命名由来。
+
+    算法流程：
+      1. 发送 G1 Z{end} F{speed*60} 让 Z 轴开始匀速运动
+      2. 每隔 interval_ms 采一帧，记录 [timestamp, 帧数据]
+      3. 运动估计完成（时间到）后停止 Z 轴
+      4. 利用时间戳把每帧映射到 Z 位置，构建锐度栈
+      5. 逐像素取最大锐度对应 Z → 深度图 → 点云
+      6. 可选：检测粗扫中平均锐度最高的 Z 子区间，自动执行第二轮细扫
+         并将细扫锐度栈叠加融合到粗扫结果中（嵌套叠叠乐核心）
+    """
+
+    # ── 信号桥（在后台线程里安全更新 UI）────────────────────────
+    _sig_status   = pyqtSignal(str, str)    # message, color
+    _sig_progress = pyqtSignal(int)
+    _sig_log      = pyqtSignal(str)
+    _sig_done     = pyqtSignal(bool, str)   # success, summary
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("以时间换位深度 — 嵌套叠叠乐")
+        self.setMinimumWidth(500)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinimizeButtonHint)
+        self._running   = False
+        self._worker    = None
+        self._depth_map = None
+        self._pc        = None          # 点云 (N,4): x_mm, y_mm, z_mm, intensity
+        self._img_size  = (0, 0)
+        self._pass_merged_sharp  = None # 融合后最大锐度图（用于阈值过滤）
+        self._setup_ui()
+        # 连接信号
+        self._sig_status  .connect(self._on_status)
+        self._sig_progress.connect(self.progressBar.setValue)
+        self._sig_log     .connect(self._append_log)
+        self._sig_done    .connect(self._on_done)
+
+    # ── UI 构建────────────────────────────────────────────────────
+
+    def _setup_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(6)
+
+        # ── 粗扫参数 ─────────────────────────────────────────────
+        grp1 = QGroupBox("第一轮：粗扫参数（连续匀速扫描）")
+        f1 = QFormLayout()
+        f1.setLabelAlignment(Qt.AlignRight)
+        self.edtZ0     = QLineEdit("-2.0")
+        self.edtZ1     = QLineEdit("2.0")
+        self.edtSpeed  = QLineEdit("1.0")
+        self.edtItvMs  = QLineEdit("80")
+        self.edtZ0   .setToolTip("Z 轴绝对坐标起始位置（mm）")
+        self.edtZ1   .setToolTip("Z 轴绝对坐标结束位置（mm）")
+        self.edtSpeed.setToolTip("Z 轴运动速度（mm/s），越慢采样越密")
+        self.edtItvMs.setToolTip("相机采帧间隔（毫秒），建议 50-200ms")
+        f1.addRow("Z 起始 (mm):",   self.edtZ0)
+        f1.addRow("Z 结束 (mm):",   self.edtZ1)
+        f1.addRow("扫描速度 (mm/s):", self.edtSpeed)
+        f1.addRow("采帧间隔 (ms):",  self.edtItvMs)
+        grp1.setLayout(f1)
+        root.addWidget(grp1)
+
+        # ── 嵌套精扫参数 ──────────────────────────────────────────
+        grp2 = QGroupBox("第二轮：嵌套精扫（叠叠乐）")
+        f2 = QFormLayout()
+        f2.setLabelAlignment(Qt.AlignRight)
+        self.chkNested    = QCheckBox("启用嵌套精扫（粗扫结束后自动执行）")
+        self.chkNested.setChecked(True)
+        self.edtFineSpeed = QLineEdit("0.3")
+        self.edtFineItvMs = QLineEdit("50")
+        self.edtFinePct   = QLineEdit("30")
+        self.edtFineSpeed.setToolTip("精扫速度（mm/s），建议 ≤ 1/3 粗扫速度")
+        self.edtFineItvMs.setToolTip("精扫采帧间隔（ms），建议比粗扫更密")
+        self.edtFinePct  .setToolTip("在粗扫结果中截取平均锐度最高的 N% 区间作为精扫范围")
+        f2.addRow(self.chkNested)
+        f2.addRow("精扫速度 (mm/s):",   self.edtFineSpeed)
+        f2.addRow("精扫采帧间隔 (ms):", self.edtFineItvMs)
+        f2.addRow("聚焦区间比例 (%):",  self.edtFinePct)
+        grp2.setLayout(f2)
+        root.addWidget(grp2)
+
+        # ── 点云参数 ──────────────────────────────────────────────
+        grp3 = QGroupBox("点云参数")
+        f3 = QFormLayout()
+        f3.setLabelAlignment(Qt.AlignRight)
+        self.edtMinSharp = QLineEdit("10.0")
+        self.edtZScale   = QLineEdit("1.0")
+        self.edtMinSharp.setToolTip("最大锐度低于此值的像素将被过滤（去除背景/模糊区）")
+        self.edtZScale  .setToolTip("Z 轴方向缩放系数（1.0 = 不缩放）")
+        f3.addRow("最小锐度阈值:", self.edtMinSharp)
+        f3.addRow("Z 轴缩放系数:", self.edtZScale)
+        grp3.setLayout(f3)
+        root.addWidget(grp3)
+
+        # ── 进度 & 状态 ──────────────────────────────────────────
+        self.progressBar = QProgressBar()
+        self.progressBar.setRange(0, 100)
+        self.progressBar.setTextVisible(True)
+        root.addWidget(self.progressBar)
+
+        self.lblStatus = QLabel("就绪 — 请确认相机已开启采集（串口连接可选）")
+        self.lblStatus.setWordWrap(True)
+        self.lblStatus.setStyleSheet("color: gray; padding: 2px;")
+        root.addWidget(self.lblStatus)
+
+        # ── 运行日志 ──────────────────────────────────────────────
+        self.txtLog = QPlainTextEdit()
+        self.txtLog.setReadOnly(True)
+        self.txtLog.setMaximumHeight(120)
+        self.txtLog.setPlaceholderText("运行日志…")
+        root.addWidget(self.txtLog)
+
+        # ── 按钮行 ────────────────────────────────────────────────
+        row1 = QHBoxLayout()
+        self.bnStart = QPushButton("▶  开始扫描")
+        self.bnStop  = QPushButton("■  停止")
+        self.bnStart.setMinimumHeight(32)
+        self.bnStop .setMinimumHeight(32)
+        self.bnStop .setEnabled(False)
+        row1.addWidget(self.bnStart)
+        row1.addWidget(self.bnStop)
+        root.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self.bnViz    = QPushButton("📊  可视化点云")
+        self.bnExport = QPushButton("💾  导出点云")
+        self.bnViz   .setMinimumHeight(30)
+        self.bnExport.setMinimumHeight(30)
+        self.bnViz   .setEnabled(False)
+        self.bnExport.setEnabled(False)
+        row2.addWidget(self.bnViz)
+        row2.addWidget(self.bnExport)
+        root.addLayout(row2)
+
+        # ── 信号 ──────────────────────────────────────────────────
+        self.bnStart .clicked.connect(self._start)
+        self.bnStop  .clicked.connect(self._stop)
+        self.bnViz   .clicked.connect(self._visualize)
+        self.bnExport.clicked.connect(self._export)
+
+    # ── 槽函数 ────────────────────────────────────────────────────
+
+    def _on_status(self, msg, color):
+        self.lblStatus.setText(msg)
+        self.lblStatus.setStyleSheet("color: {}; padding: 2px;".format(color))
+
+    def _append_log(self, msg):
+        self.txtLog.appendPlainText(msg)
+        sb = self.txtLog.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _on_done(self, success, summary):
+        self.bnStart .setEnabled(True)
+        self.bnStop  .setEnabled(False)
+        if success:
+            self.bnViz   .setEnabled(True)
+            self.bnExport.setEnabled(True)
+
+    # ── 参数解析 helper ──────────────────────────────────────────
+
+    def _parse_params(self):
+        """解析并校验所有参数，返回 dict 或抛出 ValueError"""
+        z0    = float(self.edtZ0.text().strip())
+        z1    = float(self.edtZ1.text().strip())
+        speed = float(self.edtSpeed.text().strip())
+        itv   = float(self.edtItvMs.text().strip()) / 1000.0
+        nested     = self.chkNested.isChecked()
+        fine_speed = float(self.edtFineSpeed.text().strip())
+        fine_itv   = float(self.edtFineItvMs.text().strip()) / 1000.0
+        fine_pct   = float(self.edtFinePct.text().strip())
+        min_sharp  = float(self.edtMinSharp.text().strip())
+        z_scale    = float(self.edtZScale.text().strip())
+
+        if z0 >= z1:        raise ValueError("Z 起始必须小于 Z 结束")
+        if speed <= 0:      raise ValueError("速度必须为正数")
+        if itv <= 0:        raise ValueError("采帧间隔必须为正数")
+        if fine_speed <= 0: raise ValueError("精扫速度必须为正数")
+        if fine_itv <= 0:   raise ValueError("精扫采帧间隔必须为正数")
+        if not (1 <= fine_pct <= 100):
+            raise ValueError("聚焦区间比例须在 1~100 之间")
+
+        sweep_s = (z1 - z0) / speed
+        n_est   = int(sweep_s / itv) + 1
+        if n_est < 3:
+            raise ValueError("预估采帧数过少（{}帧），请降低速度或缩小采帧间隔".format(n_est))
+        return dict(z0=z0, z1=z1, speed=speed, itv=itv,
+                    nested=nested, fine_speed=fine_speed, fine_itv=fine_itv,
+                    fine_pct=fine_pct, min_sharp=min_sharp, z_scale=z_scale,
+                    sweep_s=sweep_s, n_est=n_est)
+
+    # ── 启动/ 停止 ────────────────────────────────────────────────
+
+    def _start(self):
+        try:
+            p = self._parse_params()
+        except ValueError as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+            return
+        if not isGrabbing:
+            QMessageBox.warning(self, "错误", "请先开启相机采集！")
+            return
+
+        nest_note = ("  + 嵌套精扫：速度 {:.2f} mm/s，采帧间隔 {:.0f} ms，"
+                     "聚焦区间前 {:.0f}%\n".format(
+                         p['fine_speed'], p['fine_itv'] * 1000, p['fine_pct'])
+                     if p['nested'] else "  （不执行嵌套精扫）\n")
+        msg = ("Z 轴将匀速从 {:.2f} mm 扫描到 {:.2f} mm\n"
+               "速度 {:.2f} mm/s，预计用时 {:.1f}s，约 {} 帧\n"
+               "采帧间隔 {:.0f} ms\n"
+               "{}确认开始？".format(
+                   p['z0'], p['z1'], p['speed'], p['sweep_s'], p['n_est'],
+                   p['itv'] * 1000, nest_note))
+        if QMessageBox.question(self, "确认", msg,
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        self._running   = True
+        self._depth_map = None
+        self._pc        = None
+        self.bnStart .setEnabled(False)
+        self.bnStop  .setEnabled(True)
+        self.bnViz   .setEnabled(False)
+        self.bnExport.setEnabled(False)
+        self.progressBar.setValue(0)
+        self.txtLog.clear()
+        self._sig_status.emit("准备中…", "blue")
+
+        self._worker = threading.Thread(
+            target=self._worker_fn, args=(p,), daemon=True)
+        self._worker.start()
+
+    def _stop(self):
+        self._running = False
+        self._sig_status.emit("停止请求已发送…", "orange")
+
+    # ── 串口发送（不弹窗）────────────────────────────────────────
+
+    def _gcode(self, cmd):
+        try:
+            if is_serial_connected and serial_conn is not None:
+                serial_conn.write(cmd.encode('utf-8'))
+                self._sig_log.emit("  >> " + cmd.strip())
+                return True
+            self._sig_log.emit("  [串口未连接，跳过: {}]".format(cmd.strip()))
+            return False
+        except Exception as e:
+            self._sig_log.emit("  [串口错误: {}]".format(e))
+            return False
+
+    # ── 单次连续扫描采集 ─────────────────────────────────────────
+
+    def _do_sweep(self, z0, z1, speed, itv, label="粗扫"):
+        """
+        执行一次连续 Z 轴扫描，返回 (frames_gray_list, z_list) 或 (None, None)。
+        frames_gray_list: list of np.ndarray (h, w) float32
+        z_list:           list of float  — 每帧对应的估算 Z 位置 (mm)
+        """
+        import numpy as np
+        sweep_s = abs(z1 - z0) / speed
+
+        # 先移动到起始位置
+        self._sig_status.emit("{} — 移动到起始 Z={:.3f}mm…".format(label, z0), "blue")
+        self._gcode("G90\n")
+        self._gcode("G1 Z{:.4f} F300\n".format(z0))
+        wait = max(0.8, abs(z0) / 5.0 + 0.5)
+        t_pre = time.time()
+        while time.time() - t_pre < wait:
+            if not self._running:
+                return None, None
+            time.sleep(0.05)
+
+        # 探测图像尺寸
+        data0, w, h = obj_cam_operation.Get_frame_numpy()
+        if data0 is None or w == 0 or h == 0:
+            self._sig_status.emit("错误：无法获取相机帧", "red")
+            return None, None
+        self._sig_log.emit("  图像尺寸 {}×{}".format(w, h))
+
+        # 发出匀速运动指令（F 单位 mm/min）
+        feedrate = speed * 60.0
+        self._sig_status.emit("{} — Z 轴开始匀速扫描，速度 {:.2f} mm/s…".format(label, speed), "blue")
+        self._gcode("G1 Z{:.4f} F{:.1f}\n".format(z1, feedrate))
+        t_start = time.time()
+
+        frames_gray = []
+        z_list      = []
+        next_cap    = t_start
+
+        while self._running:
+            now = time.time()
+            elapsed = now - t_start
+
+            # 时间映射 Z 位置
+            z_est = z0 + (z1 - z0) * min(elapsed / sweep_s, 1.0)
+
+            # 采帧
+            if now >= next_cap:
+                data, fw, fh = obj_cam_operation.Get_frame_numpy()
+                if data is not None and fw == w and fh == h and len(data) >= w * h:
+                    gray = data[:w * h].reshape(h, w).astype(np.float32)
+                    frames_gray.append(gray)
+                    z_list.append(z_est)
+                next_cap += itv
+
+            # 更新进度（此方法返回 0-50 段由调用方按需缩放）
+            frac = min(elapsed / sweep_s, 1.0)
+            if label == "粗扫":
+                self._sig_progress.emit(int(frac * 45))
+            else:
+                self._sig_progress.emit(50 + int(frac * 30))
+
+            # 运动估算完成退出
+            if elapsed >= sweep_s + 0.3:   # 多等 300ms 让 Z 稳定
+                break
+            time.sleep(max(0, next_cap - time.time()))
+
+        # 停止 Z 轴（发送当前估算位置）
+        self._gcode("G1 Z{:.4f} F300\n".format(z_est if z_list else z1))
+        self._sig_log.emit("  {} 结束：采集 {} 帧，Z 估算范围 {:.3f}~{:.3f} mm".format(
+            label, len(frames_gray),
+            min(z_list) if z_list else z0,
+            max(z_list) if z_list else z1))
+        return frames_gray, z_list
+
+    # ── 构建锐度栈 → 深度图 helper ─────────────────────────────
+
+    @staticmethod
+    def _build_sharpness_stack(frames_gray, z_list):
+        """
+        将帧列表构建为稀疏锐度栈。
+        返回 depth_map (h, w), max_sharp (h, w)。
+        使用增量式更新（内存友好），不保留完整 N×H×W 栈。
+        """
+        import numpy as np
+        if not frames_gray:
+            return None, None
+        h, w = frames_gray[0].shape
+        best_sharp = np.zeros((h, w), dtype=np.float32)  # 每像素最大锐度
+        best_z_map = np.zeros((h, w), dtype=np.float32)  # 对应 Z 值
+        best_gray  = np.zeros((h, w), dtype=np.float32)  # 对应灰度（强度）
+
+        for gray, z_pos in zip(frames_gray, z_list):
+            # 拉普拉斯平方锐度图
+            lap = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
+                   gray[1:-1, :-2] + gray[1:-1, 2:] -
+                   4.0 * gray[1:-1, 1:-1])
+            sharp = np.zeros((h, w), dtype=np.float32)
+            sharp[1:-1, 1:-1] = lap * lap
+            # 增量最大值更新
+            mask = sharp > best_sharp
+            best_sharp[mask] = sharp[mask]
+            best_z_map[mask] = z_pos
+            best_gray [mask] = gray[mask]
+
+        return best_z_map, best_sharp, best_gray
+
+    # ── 核心后台工作线程 ─────────────────────────────────────────
+
+    def _worker_fn(self, p):
+        try:
+            import numpy as np
+        except ImportError:
+            self._sig_status.emit("三维重建需要 numpy，请执行 pip install numpy", "red")
+            self._running = False
+            self._sig_done.emit(False, "")
+            return
+
+        try:
+            self._sig_log.emit("═══ 开始 以时间换位深度（嵌套叠叠乐） ═══")
+            self._sig_log.emit("粗扫: Z {:.2f}→{:.2f}mm  速度 {:.2f}mm/s  采帧 {:.0f}ms".format(
+                p['z0'], p['z1'], p['speed'], p['itv'] * 1000))
+
+            # ══ 第一轮：粗扫 ══════════════════════════════════════
+            self._sig_status.emit("第一轮 粗扫…", "blue")
+            frames1, zlist1 = self._do_sweep(
+                p['z0'], p['z1'], p['speed'], p['itv'], label="粗扫")
+            if not self._running or frames1 is None or len(frames1) < 3:
+                self._sig_status.emit(
+                    "粗扫{}".format("已停止" if not self._running else "帧不足，请检查相机"), "orange")
+                self._sig_done.emit(False, "")
+                return
+
+            self._sig_log.emit("粗扫完成，共 {} 帧".format(len(frames1)))
+            self._sig_progress.emit(48)
+
+            # 建立粗扫锐度栈
+            depth_map, sharp_map, gray_map = self._build_sharpness_stack(frames1, zlist1)
+            if depth_map is None:
+                self._sig_status.emit("锐度栈生成失败", "red")
+                self._sig_done.emit(False, "")
+                return
+            h, w = depth_map.shape
+            self._img_size = (w, h)
+            self._sig_progress.emit(52)
+
+            # ══ 第二轮：嵌套精扫（叠叠乐）══════════════════════════
+            if p['nested'] and self._running:
+                self._sig_log.emit("── 嵌套精扫开始 ──────────────────────────────")
+                # 定位粗扫中平均锐度最高的 Z 子区间
+                # 将 Z 范围分成若干 bin，找到 top-N% 的 Z 区间
+                n_bins    = max(10, len(frames1))
+                z_min_val = float(min(zlist1))
+                z_max_val = float(max(zlist1))
+                bin_edges = np.linspace(z_min_val, z_max_val, n_bins + 1)
+                bin_sharp = np.zeros(n_bins, dtype=np.float64)
+                bin_count = np.zeros(n_bins, dtype=np.int32)
+
+                for i, (frame, z_pos) in enumerate(zip(frames1, zlist1)):
+                    b = min(int((z_pos - z_min_val) / (z_max_val - z_min_val + 1e-9) * n_bins),
+                            n_bins - 1)
+                    lap = (frame[:-2, 1:-1] + frame[2:, 1:-1] +
+                           frame[1:-1, :-2] + frame[1:-1, 2:] -
+                           4.0 * frame[1:-1, 1:-1])
+                    bin_sharp[b] += float(np.mean(lap * lap))
+                    bin_count[b] += 1
+
+                # 取覆盖 fine_pct% 行程的最高锐度 bin 区间
+                mean_sharp = np.where(bin_count > 0,
+                                      bin_sharp / np.maximum(bin_count, 1), 0.0)
+                n_select = max(1, int(n_bins * p['fine_pct'] / 100.0))
+                top_bins = np.argsort(mean_sharp)[::-1][:n_select]
+                fz0 = float(bin_edges[min(top_bins)])
+                fz1 = float(bin_edges[min(max(top_bins) + 1, n_bins)])
+                # 保证精扫范围至少 0.1mm
+                if fz1 - fz0 < 0.1:
+                    mid = (fz0 + fz1) / 2.0
+                    fz0, fz1 = mid - 0.05, mid + 0.05
+
+                self._sig_log.emit("  精扫区间: {:.3f} ~ {:.3f} mm  (Delta {:.3f} mm)".format(
+                    fz0, fz1, fz1 - fz0))
+
+                frames2, zlist2 = self._do_sweep(
+                    fz0, fz1, p['fine_speed'], p['fine_itv'], label="精扫")
+
+                if frames2 and len(frames2) >= 2 and self._running:
+                    self._sig_log.emit("  精扫帧数: {}".format(len(frames2)))
+                    # 用精扫数据更新融合锐度栈（叠加）
+                    depth_f, sharp_f, gray_f = self._build_sharpness_stack(frames2, zlist2)
+                    if depth_f is not None:
+                        mask = sharp_f > sharp_map
+                        sharp_map[mask] = sharp_f[mask]
+                        depth_map[mask] = depth_f[mask]
+                        gray_map [mask] = gray_f [mask]
+                        n_upd = int(np.sum(mask))
+                        self._sig_log.emit("  叠叠乐融合: {:,} 个像素由精扫更新".format(n_upd))
+                else:
+                    self._sig_log.emit("  精扫帧不足或已停止，跳过融合")
+            elif not p['nested']:
+                self._sig_log.emit("（未启用嵌套精扫）")
+
+            if not self._running:
+                self._sig_status.emit("已停止", "orange")
+                self._sig_done.emit(False, "")
+                return
+
+            self._sig_progress.emit(85)
+            self._sig_status.emit("生成点云…", "blue")
+
+            # ══ 生成点云 ══════════════════════════════════════════
+            z_scale   = p['z_scale']
+            min_sharp = p['min_sharp']
+            ppmm      = pixels_per_mm if pixels_per_mm > 0 else 1.0
+
+            valid = sharp_map > min_sharp
+            ys, xs = np.where(valid)
+            if len(xs) == 0:
+                self._sig_status.emit(
+                    "没有找到有效点！请降低最小锐度阈值（当前 {:.1f}）".format(min_sharp), "red")
+                self._sig_done.emit(False, "")
+                return
+
+            x_mm = (xs.astype(np.float32) - w / 2.0) / ppmm
+            y_mm = (ys.astype(np.float32) - h / 2.0) / ppmm
+            z_mm = depth_map[ys, xs] * z_scale
+            intv = gray_map [ys, xs]
+
+            self._pc        = np.column_stack([x_mm, y_mm, z_mm, intv]).astype(np.float32)
+            self._depth_map = depth_map
+            self._sharp_map = sharp_map
+
+            self._sig_progress.emit(100)
+            n_pts   = len(self._pc)
+            cov_pct = 100.0 * n_pts / (w * h)
+            summary = ("扫描完成 ✓   点数: {:,}   覆盖率: {:.1f}%\n"
+                       "pixels/mm={:.2f}  图像 {}×{}".format(
+                           n_pts, cov_pct, ppmm, w, h))
+            self._sig_status.emit(summary, "green")
+            self._sig_log.emit("═══ 完成：{:,} 点，覆盖率 {:.1f}% ═══".format(n_pts, cov_pct))
+            self._sig_done.emit(True, summary)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._sig_status.emit("发生异常: " + str(e), "red")
+            self._sig_log.emit("[ERROR] " + str(e))
+            self._sig_done.emit(False, "")
+        finally:
+            self._running = False
+
+    # ── 可视化 ────────────────────────────────────────────────────
+
+    def _visualize(self):
+        if self._pc is None or len(self._pc) == 0:
+            QMessageBox.warning(self, "提示", "暂无点云数据，请先执行扫描重建。")
+            return
+        try:
+            import numpy as np
+            import matplotlib
+            matplotlib.use('Qt5Agg')
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+            pc = self._pc
+            fp = _get_mpl_font()
+            tkw = {'fontproperties': fp} if fp else {}
+
+            fig = plt.figure(figsize=(16, 6))
+            fig.suptitle("以时间换位深度 — 嵌套叠叠乐 点云", fontsize=14, **tkw)
+
+            # 图1：深度图（热力图）
+            ax1 = fig.add_subplot(1, 3, 1)
+            if self._depth_map is not None:
+                ppmm = pixels_per_mm if pixels_per_mm > 0 else 1.0
+                w, h = self._img_size
+                ext  = [-w / (2 * ppmm), w / (2 * ppmm),
+                         h / (2 * ppmm), -h / (2 * ppmm)]
+                im = ax1.imshow(self._depth_map, cmap='plasma', origin='upper', extent=ext)
+                plt.colorbar(im, ax=ax1).set_label('Depth (mm)')
+                ax1.set_title("Depth Map", **tkw)
+                ax1.set_xlabel("X (mm)")
+                ax1.set_ylabel("Y (mm)")
+
+            # 图2：锐度图
+            ax2 = fig.add_subplot(1, 3, 2)
+            if hasattr(self, '_sharp_map') and self._sharp_map is not None:
+                im2 = ax2.imshow(
+                    np.log1p(self._sharp_map), cmap='hot', origin='upper')
+                plt.colorbar(im2, ax=ax2).set_label('log(1+sharpness)')
+                ax2.set_title("Sharpness Map (log)", **tkw)
+
+            # 图3：三维点云（降采样）
+            ax3 = fig.add_subplot(1, 3, 3, projection='3d')
+            x, y, z, iv = pc[:, 0], pc[:, 1], pc[:, 2], pc[:, 3]
+            MAX_PTS = 60000
+            if len(x) > MAX_PTS:
+                idx = np.random.choice(len(x), MAX_PTS, replace=False)
+                x, y, z, iv = x[idx], y[idx], z[idx], iv[idx]
+            sc = ax3.scatter(x, y, z, c=iv, cmap='gray', s=0.5, alpha=0.6)
+            plt.colorbar(sc, ax=ax3, label='Intensity')
+            ax3.set_xlabel("X (mm)"); ax3.set_ylabel("Y (mm)"); ax3.set_zlabel("Z (mm)")
+            ax3.set_title("Point Cloud ({:,} pts)".format(len(self._pc)), **tkw)
+
+            plt.tight_layout()
+            plt.show()
+        except ImportError:
+            QMessageBox.warning(self, "依赖缺失",
+                                "可视化需要 matplotlib:\npip install matplotlib")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            QMessageBox.warning(self, "可视化错误", str(e))
+
+    # ── 导出 ──────────────────────────────────────────────────────
+
+    def _export(self):
+        if self._pc is None or len(self._pc) == 0:
+            QMessageBox.warning(self, "提示", "暂无点云数据，请先执行扫描重建。")
+            return
+        default = "temporal_depth_{}.ply".format(
+            datetime.now().strftime("%Y%m%d_%H%M%S"))
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出点云",
+            os.path.join(get_effective_save_path(), default),
+            "PLY 文件 (*.ply);;CSV 文件 (*.csv);;全部文件 (*.*)")
+        if not path:
+            return
+        try:
+            pc = self._pc
+            n  = len(pc)
+            if path.lower().endswith('.csv'):
+                import csv
+                with open(path, 'w', newline='', encoding='utf-8') as f:
+                    csv.writer(f).writerows(
+                        [['x_mm', 'y_mm', 'z_mm', 'intensity']] + pc.tolist())
+                QMessageBox.information(self, "导出完成",
+                                        "已导出 {:,} 个点（CSV）\n{}".format(n, path))
+            else:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write("ply\nformat ascii 1.0\n")
+                    f.write("comment Generated by BasicDemo TemporalDepth\n")
+                    f.write("comment pixels_per_mm={:.4f}\n".format(pixels_per_mm))
+                    f.write("element vertex {}\n".format(n))
+                    f.write("property float x\nproperty float y\n"
+                            "property float z\nproperty float intensity\n")
+                    f.write("end_header\n")
+                    for row in pc:
+                        f.write("{:.6f} {:.6f} {:.6f} {:.2f}\n".format(
+                            float(row[0]), float(row[1]), float(row[2]), float(row[3])))
+                QMessageBox.information(
+                    self, "导出完成",
+                    "已导出 {:,} 个点（PLY）\n支持 MeshLab / CloudCompare / Open3D\n{}".format(
+                        n, path))
+            print("[TemporalDepth] 点云已导出: {}".format(path))
+        except Exception as e:
+            QMessageBox.warning(self, "导出错误", str(e))
+
+
 if __name__ == "__main__":
 
     # ch:初始化SDK | en: initialize SDK
@@ -705,6 +1326,8 @@ if __name__ == "__main__":
     _cam_img_width = 0
     global _recon3d_dialog            # 三维重建对话框（单例，懒加载）
     _recon3d_dialog = None
+    global _temporal_depth_dialog        # 以时间换位深度对话框（单例，懒加载）
+    _temporal_depth_dialog = None
 
     # 脚本所在目录作为默认保存路径
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1780,33 +2403,55 @@ if __name__ == "__main__":
         _recon3d_dialog.raise_()
         _recon3d_dialog.activateWindow()
 
+    def open_temporal_depth_dialog():
+        """打开（或激活已存在的）以时间换位深度对话框"""
+        global _temporal_depth_dialog
+        if _temporal_depth_dialog is None:
+            _temporal_depth_dialog = TemporalDepthDialog(mainWindow)
+        _temporal_depth_dialog.show()
+        _temporal_depth_dialog.raise_()
+        _temporal_depth_dialog.activateWindow()
+
     menubar = mainWindow.menuBar()
     menu_recon = menubar.addMenu("三维重建(&3D)")
-    act_open_recon = menu_recon.addAction("打开点云重建窗口…")
-    act_open_recon.setToolTip("基于深度从焦点（Depth From Focus）算法重建三维点云")
+    act_open_recon = menu_recon.addAction("① 停-拍-移 点云重建（DFF）…")
+    act_open_recon.setToolTip("Z 轴逐步停顿采集，基于深度从焦点算法重建三维点云")
     act_open_recon.triggered.connect(open_recon3d_dialog)
+    act_temporal = menu_recon.addAction("② 以时间换位深度（嵌套叠叠乐）…")
+    act_temporal.setToolTip("Z 轴匀速连续扫描 + 时间映射 Z 位置 + 嵌套精扫融合")
+    act_temporal.triggered.connect(open_temporal_depth_dialog)
     menu_recon.addSeparator()
     act_help = menu_recon.addAction("使用说明")
     act_help.triggered.connect(lambda: QMessageBox.information(
         mainWindow, "三维重建使用说明",
-        "【三维重建 — 深度从焦点算法】\n\n"
-        "原理：\n"
-        "  通过逐步移动 Z 轴，在每个 Z 位置采集一帧图像，\n"
-        "  计算每个像素的清晰度（拉普拉斯算子平方），\n"
-        "  找出每个像素清晰度最高时对应的 Z 值作为该点的深度，\n"
-        "  最终利用相机标定值（pixels/mm）将像素坐标转换为\n"
-        "  物理坐标（mm），生成三维点云。\n\n"
+        "══════════════════════════════════════\n"
+        "① 停-拍-移 点云重建（DFF）\n"
+        "══════════════════════════════════════\n"
+        "原理：Z 轴逐步停顿 → 每步拍一帧 → 逐像素取锐度最大 Z 值\n\n"
+        "适用：高精度场景，Z 轴定位准确，场景静止\n"
+        "缺点：速度慢（每步需等待运动稳定）\n\n"
         "使用步骤：\n"
-        "  1. 打开相机并开始采集\n"
-        "  2. 连接串口（用于 G-code 控制 Z 轴）\n"
-        "  3. 在比例尺标定中设置好 pixels/mm\n"
-        "  4. 打开此窗口，设置 Z 扫描范围和步长\n"
-        "  5. 点击「开始重建」等待扫描完成\n"
-        "  6. 可视化查看深度图和点云，或导出 .ply/.csv 文件\n\n"
-        "提示：\n"
-        "  • Z 步长越小精度越高，耗时越长\n"
-        "  • 建议先用大步长粗扫再缩小范围细扫\n"
-        "  • 导出的 .ply 文件可用 MeshLab / CloudCompare / Open3D 打开"))
+        "  1. 开启相机采集  2. 连接串口\n"
+        "  3. 设置好 pixels/mm  4. 设置 Z 范围和步长\n"
+        "  5. 点击「开始重建」  6. 可视化/导出点云\n\n"
+        "══════════════════════════════════════\n"
+        "② 以时间换位深度（嵌套叠叠乐）\n"
+        "══════════════════════════════════════\n"
+        "原理：Z 轴匀速连续扫描，相机同步按时间间隔采帧，\n"
+        "      每帧 Z 位置由 z(t)=z₀+speed×t 推算，\n"
+        "      可选「嵌套精扫」—— 粗扫后自动定位最佳焦深区间，\n"
+        "      再以更低速度细扫并与粗扫数据融合（叠叠乐）。\n\n"
+        "优点：Z 轴无需停顿，采帧效率高；嵌套融合逐步提升精度\n"
+        "缺点：依赖 Z 轴匀速精度（开环时间估算）\n\n"
+        "使用步骤：\n"
+        "  1. 开启相机采集（串口连接可选，无串口时 Z 不动）\n"
+        "  2. 设置 Z 范围、扫描速度、采帧间隔\n"
+        "  3. 勾选「嵌套精扫」并配置精扫参数\n"
+        "  4. 点击「开始扫描」，等待粗扫 + 精扫完成\n"
+        "  5. 查看日志了解叠叠乐融合结果\n"
+        "  6. 可视化深度图/锐度图/点云，或导出 .ply/.csv\n\n"
+        "两种模式均可导出 .ply 文件，\n"
+        "支持 MeshLab / CloudCompare / Open3D 打开"))
     ui.bnCaptureDark.clicked.connect(capture_dark_frame)
     ui.chkDarkSub.stateChanged.connect(toggle_dark_sub)
     ui.bnClearDark.clicked.connect(clear_dark_frame)
