@@ -308,6 +308,35 @@ class Ui_MainWindow(object):
         self.lblScaleBarInfo.setAlignment(QtCore.Qt.AlignCenter)
         scaleGrid.addWidget(self.lblScaleBarInfo, 3, 0, 1, 2)
 
+        # 分隔标签
+        self.lblAutoCalibSep = QtWidgets.QLabel()
+        self.lblAutoCalibSep.setObjectName("lblAutoCalibSep")
+        self.lblAutoCalibSep.setAlignment(QtCore.Qt.AlignCenter)
+        self.lblAutoCalibSep.setStyleSheet("color: gray; font-size: 10px;")
+        scaleGrid.addWidget(self.lblAutoCalibSep, 4, 0, 1, 2)
+
+        # 移动距离输入
+        self.label_calib_move = QtWidgets.QLabel()
+        self.label_calib_move.setObjectName("label_calib_move")
+        scaleGrid.addWidget(self.label_calib_move, 5, 0)
+
+        self.edtCalibMoveMm = QtWidgets.QLineEdit()
+        self.edtCalibMoveMm.setObjectName("edtCalibMoveMm")
+        scaleGrid.addWidget(self.edtCalibMoveMm, 5, 1)
+
+        # 自动标定按钮
+        self.bnAutoCalib = QtWidgets.QPushButton()
+        self.bnAutoCalib.setObjectName("bnAutoCalib")
+        self.bnAutoCalib.setEnabled(False)
+        scaleGrid.addWidget(self.bnAutoCalib, 6, 0, 1, 2)
+
+        # 自动标定状态标签
+        self.lblAutoCalibStatus = QtWidgets.QLabel()
+        self.lblAutoCalibStatus.setObjectName("lblAutoCalibStatus")
+        self.lblAutoCalibStatus.setAlignment(QtCore.Qt.AlignCenter)
+        self.lblAutoCalibStatus.setWordWrap(True)
+        scaleGrid.addWidget(self.lblAutoCalibStatus, 7, 0, 1, 2)
+
         scaleGrid.setColumnStretch(0, 2)
         scaleGrid.setColumnStretch(1, 3)
 
@@ -385,3 +414,9 @@ class Ui_MainWindow(object):
         self.edtPixelsPerMm.setText(_translate("MainWindow", "100.0"))
         self.bnSetScaleCalib.setText(_translate("MainWindow", "应用标定值"))
         self.lblScaleBarInfo.setText(_translate("MainWindow", ""))
+        # 自动标定
+        self.lblAutoCalibSep.setText(_translate("MainWindow", "── 自动标定 ──"))
+        self.label_calib_move.setText(_translate("MainWindow", "移动距离(mm)"))
+        self.edtCalibMoveMm.setText(_translate("MainWindow", "1.0"))
+        self.bnAutoCalib.setText(_translate("MainWindow", "自动标定"))
+        self.lblAutoCalibStatus.setText(_translate("MainWindow", "就绪"))

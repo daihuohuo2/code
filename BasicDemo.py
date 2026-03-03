@@ -197,6 +197,8 @@ if __name__ == "__main__":
     auto_capture_running = False
     global autofocus_running
     autofocus_running = False
+    global auto_calib_running
+    auto_calib_running = False
     global serial_conn
     serial_conn = None
     global is_serial_connected
@@ -958,6 +960,159 @@ if __name__ == "__main__":
             pixels_per_mm, 1000.0 / pixels_per_mm)
         ui.lblScaleBarInfo.setText(info)
 
+    # ── 自动标定 ─────────────────────────────────────────────────
+
+    def _phase_correlation_shift(frame1, frame2):
+        """
+        使用相位相关法计算两帧之间的亚像素位移幅度。
+        返回 (dx, dy)：正值表示帧2相对帧1在对应方向的位移（像素）。
+        若无法计算则返回 (0.0, 0.0)。
+        """
+        try:
+            import numpy as np
+            f1 = frame1.astype(np.float64) - np.mean(frame1)
+            f2 = frame2.astype(np.float64) - np.mean(frame2)
+            F1 = np.fft.fft2(f1)
+            F2 = np.fft.fft2(f2)
+            # 归一化互功率谱
+            R = F1 * np.conj(F2)
+            eps = np.abs(R).max() * 1e-10 + 1e-30
+            R = R / (np.abs(R) + eps)
+            # 逆变换并找峰值
+            r = np.fft.ifft2(R).real
+            idx = np.unravel_index(np.argmax(r), r.shape)
+            dy, dx = int(idx[0]), int(idx[1])
+            h, w = frame1.shape[:2]
+            # 处理环绕（移位量 > 图像半边）
+            if dy > h // 2:
+                dy -= h
+            if dx > w // 2:
+                dx -= w
+            return float(dx), float(dy)
+        except Exception as e:
+            print("[AutoCalib] 相位相关异常:", e)
+            return 0.0, 0.0
+
+    def _auto_calib_worker(move_mm, axis):
+        """
+        自动标定后台线程：
+          1. 采集初始帧
+          2. 沿指定轴移动已知距离
+          3. 采集移动后帧
+          4. 用相位相关计算像素位移
+          5. pixels_per_mm = |位移| / move_mm，更新标定值
+        axis: 'X' 或 'Y'，决定使用 dx 还是 dy
+        """
+        global auto_calib_running
+
+        def set_status(msg):
+            QTimer.singleShot(0, lambda m=msg: ui.lblAutoCalibStatus.setText(m))
+
+        try:
+            import numpy as np
+
+            # ── 帧1 ──
+            set_status("标定中… 采集初始帧")
+            print("[AutoCalib] 采集帧1")
+            data1, w, h = obj_cam_operation.Get_frame_numpy()
+            if data1 is None or w == 0 or h == 0 or len(data1) < w * h:
+                set_status("标定失败：无法获取初始帧")
+                return
+            frame1 = data1[:w * h].reshape(h, w).astype(np.float32)
+
+            # ── 移动已知距离 ──
+            set_status("标定中… 移动 {:.3f}mm ({})轴".format(move_mm, axis))
+            print("[AutoCalib] 移动 {}轴 {:.3f}mm".format(axis, move_mm))
+            if not send_gcode("G91\n"):
+                set_status("标定失败：串口错误（G91）")
+                return
+            if not send_gcode("G1 {}{:.4f} F300\n".format(axis, move_mm)):
+                set_status("标定失败：串口错误（移动）")
+                return
+            if not send_gcode("G90\n"):
+                set_status("标定失败：串口错误（G90）")
+                return
+            # 等待运动完成（依据距离动态估算）
+            wait_s = max(0.5, abs(move_mm) / 10.0 + 0.4)
+            time.sleep(wait_s)
+
+            # ── 帧2 ──
+            set_status("标定中… 采集移动后帧")
+            print("[AutoCalib] 采集帧2")
+            data2, w2, h2 = obj_cam_operation.Get_frame_numpy()
+            if data2 is None or w2 == 0 or h2 == 0 or len(data2) < w2 * h2:
+                set_status("标定失败：无法获取移动后帧")
+                return
+            frame2 = data2[:w2 * h2].reshape(h2, w2).astype(np.float32)
+
+            # ── 相位相关 ──
+            set_status("标定中… 计算像素位移")
+            dx, dy = _phase_correlation_shift(frame1, frame2)
+            shift_px = abs(dx) if axis.upper() == 'X' else abs(dy)
+            print("[AutoCalib] dx={:.2f}px  dy={:.2f}px  使用{}方向={:.2f}px".format(
+                dx, dy, axis, shift_px))
+
+            if shift_px < 1.0:
+                set_status("标定失败：位移过小({:.2f}px)\n请增大移动距离或确保视野有纹理".format(shift_px))
+                return
+
+            # ── 计算并更新 pixels/mm ──
+            ppmm = shift_px / abs(move_mm)
+            print("[AutoCalib] pixels/mm = {:.4f}".format(ppmm))
+
+            def _update_ui():
+                global pixels_per_mm
+                pixels_per_mm = ppmm
+                ui.edtPixelsPerMm.setText("{:.4f}".format(ppmm))
+                _apply_scale_calib()
+                ui.lblAutoCalibStatus.setText(
+                    "标定完成 ✓\n{:.2f} px/mm | {:.3f} µm/px".format(
+                        ppmm, 1000.0 / ppmm))
+            QTimer.singleShot(0, _update_ui)
+
+        except Exception as e:
+            print("[AutoCalib] 异常:", e)
+            set_status("标定失败: " + str(e))
+        finally:
+            auto_calib_running = False
+            QTimer.singleShot(0, lambda: ui.bnAutoCalib.setEnabled(True))
+
+    def start_auto_calib():
+        """读取 UI 输入并启动自动标定线程"""
+        global auto_calib_running
+        if not isGrabbing:
+            QMessageBox.warning(mainWindow, "错误", "请先开始采集！", QMessageBox.Ok)
+            return
+        if not is_serial_connected:
+            QMessageBox.warning(mainWindow, "错误", "请先连接串口！", QMessageBox.Ok)
+            return
+        if auto_calib_running:
+            QMessageBox.warning(mainWindow, "提示", "标定正在进行中！", QMessageBox.Ok)
+            return
+        move_str = ui.edtCalibMoveMm.text().strip()
+        try:
+            move_mm = float(move_str)
+            if abs(move_mm) < 0.01:
+                raise ValueError("移动量过小")
+        except ValueError:
+            QMessageBox.warning(mainWindow, "输入错误",
+                                "请输入有效的移动距离（mm），最小 0.01mm。",
+                                QMessageBox.Ok)
+            return
+        # 询问标定轴
+        axis, ok = QInputDialog.getItem(
+            mainWindow, "选择标定轴",
+            "请选择移动轴（相机水平方向通常对应 X）：",
+            ["X", "Y"], 0, False)
+        if not ok:
+            return
+        auto_calib_running = True
+        ui.bnAutoCalib.setEnabled(False)
+        ui.lblAutoCalibStatus.setText("标定中…")
+        t = threading.Thread(
+            target=_auto_calib_worker, args=(move_mm, axis), daemon=True)
+        t.start()
+
     def get_param():
         ret = obj_cam_operation.Get_parameter()
         if ret != MV_OK:
@@ -1006,6 +1161,7 @@ if __name__ == "__main__":
         ui.bnAutoCapture.setEnabled(isOpen and isGrabbing)
         ui.bnAutoFocus.setEnabled(isOpen and isGrabbing and not autofocus_running)
         ui.bnStopAutoFocus.setEnabled(autofocus_running)
+        ui.bnAutoCalib.setEnabled(isOpen and isGrabbing and not auto_calib_running)
 
     # ch: 初始化app, 绑定控件与函数 | en: Init app, bind ui and api
     app = QApplication(sys.argv)
@@ -1042,6 +1198,7 @@ if __name__ == "__main__":
     ui.bnMoveStep.clicked.connect(action_move_z_step)
     ui.bnSetLight.clicked.connect(action_set_light)
     ui.bnSetScaleCalib.clicked.connect(_apply_scale_calib)
+    ui.bnAutoCalib.clicked.connect(start_auto_calib)
     ui.chkShowScaleBar.stateChanged.connect(_toggle_scale_bar)
 
     load_settings()
