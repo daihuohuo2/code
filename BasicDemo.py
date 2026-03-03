@@ -13,7 +13,8 @@ except ImportError:
     _SERIAL_AVAILABLE = False
     print("[Warning] pyserial 未安装，串口功能不可用。请执行: pip install pyserial")
 from PyQt5.QtWidgets import *
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, QObject, QEvent, Qt
+from PyQt5.QtGui import QPainter, QColor, QPen, QFont
 from CamOperation_class import CameraOperation
 from MvCameraControl_class import *
 from MvErrorDefine_const import *
@@ -46,6 +47,131 @@ def ToHexStr(num):
     return hexStr
 
 
+# ──────────────────────────────────────────────────────────────────
+#  比例尺叠加层（透明子 Widget，覆盖在 widgetDisplay 正上方）
+# ──────────────────────────────────────────────────────────────────
+class ScaleBarOverlay(QWidget):
+    """透明比例尺叠加层，绘制在相机预览区右上方。"""
+
+    # 候选比例尺长度（mm）
+    NICE_LENGTHS_MM = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5,
+                       1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+
+    def __init__(self, parent_widget):
+        super().__init__(parent_widget)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setGeometry(parent_widget.rect())
+        self._pixels_per_mm = 100.0   # 相机图像像素/mm（标定值）
+        self._img_width = 0            # 相机采集图像宽度（0 = 未知）
+        self._bar_visible = False
+        self.raise_()
+
+    def set_pixels_per_mm(self, value):
+        self._pixels_per_mm = max(value, 0.001)
+        self.update()
+
+    def set_img_width(self, w):
+        self._img_width = w
+        self.update()
+
+    def set_visible(self, visible):
+        self._bar_visible = visible
+        self.update()
+
+    def update_size(self):
+        """跟随父控件尺寸调整自身大小。"""
+        self.setGeometry(self.parentWidget().rect())
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._bar_visible or self._pixels_per_mm <= 0:
+            return
+
+        display_w = self.width()
+        display_h = self.height()
+        if display_w <= 0 or display_h <= 0:
+            return
+
+        # 计算显示像素/mm（考虑图像缩放比例）
+        if self._img_width > 0:
+            scale_factor = display_w / self._img_width
+        else:
+            scale_factor = 1.0
+        display_ppmm = self._pixels_per_mm * scale_factor
+
+        # 选取使比例尺约占显示宽度 20% 的最大"美观"长度
+        target_px = display_w * 0.20
+        bar_len_mm = self.NICE_LENGTHS_MM[0]
+        bar_len_px = bar_len_mm * display_ppmm
+        for L in self.NICE_LENGTHS_MM:
+            px = L * display_ppmm
+            if px > target_px:
+                break
+            bar_len_mm = L
+            bar_len_px = px
+        bar_len_px = max(bar_len_px, 4)
+
+        # 格式化标签
+        if bar_len_mm >= 1.0:
+            label = "{:.0f} mm".format(bar_len_mm) if bar_len_mm == int(bar_len_mm) else "{} mm".format(bar_len_mm)
+        else:
+            label = "{:.0f} µm".format(bar_len_mm * 1000)
+
+        # 绘制位置（左下角留边距）
+        margin = 16
+        bar_h = 8
+        x0 = margin
+        y0 = display_h - margin - bar_h - 18  # 18 px 留给文字
+        x1 = x0 + int(bar_len_px)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # 黑色阴影底层（提升可读性）
+        shadow_pen = QPen(QColor(0, 0, 0, 180))
+        shadow_pen.setWidth(3)
+        painter.setPen(shadow_pen)
+        painter.drawLine(x0, y0 + bar_h, x1, y0 + bar_h)  # 底边阴影
+
+        # 绘制白色刻度条
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 160))
+        painter.drawRect(x0 - 2, y0 - 2, int(bar_len_px) + 4, bar_h + 4)
+        painter.setBrush(QColor(255, 255, 255, 230))
+        painter.drawRect(x0, y0, int(bar_len_px), bar_h)
+
+        # 两端刻度竖线
+        tick_pen = QPen(QColor(255, 255, 255, 230), 2)
+        painter.setPen(tick_pen)
+        tick_h = bar_h + 4
+        painter.drawLine(x0, y0 - 2, x0, y0 + tick_h)
+        painter.drawLine(x1, y0 - 2, x1, y0 + tick_h)
+
+        # 绘制标签文字
+        font = QFont("Arial", 9, QFont.Bold)
+        painter.setFont(font)
+        # 黑色阴影
+        painter.setPen(QColor(0, 0, 0, 200))
+        painter.drawText(x0 + 1, y0 - 3, label)
+        # 白色前景
+        painter.setPen(QColor(255, 255, 255, 240))
+        painter.drawText(x0, y0 - 4, label)
+        painter.end()
+
+
+class _ResizeFilter(QObject):
+    """事件过滤器：监听 widgetDisplay 的 Resize 事件，同步更新叠加层尺寸。"""
+    def __init__(self, overlay):
+        super().__init__()
+        self._overlay = overlay
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Resize:
+            self._overlay.update_size()
+        return False
+
+
 if __name__ == "__main__":
 
     # ch:初始化SDK | en: initialize SDK
@@ -75,6 +201,12 @@ if __name__ == "__main__":
     serial_conn = None
     global is_serial_connected
     is_serial_connected = False
+    global pixels_per_mm          # 相机图像像素/mm（比例尺标定值）
+    pixels_per_mm = 100.0
+    global scale_overlay           # ScaleBarOverlay 实例（setupUi 后创建）
+    scale_overlay = None
+    global _cam_img_width          # 最近一帧的相机图像宽度（用于显示缩放比）
+    _cam_img_width = 0
 
     # 脚本所在目录作为默认保存路径
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -251,6 +383,8 @@ if __name__ == "__main__":
         else:
             isGrabbing = True
             enable_controls()
+            # 延迟 800ms 后尝试获取图像分辨率，用于比例尺显示缩放
+            QTimer.singleShot(800, _poll_cam_img_width)
 
     # ch:停止取流 | en:Stop grab image
     def stop_grabbing():
@@ -318,8 +452,8 @@ if __name__ == "__main__":
 
     # ---- 设置读写 ----
     def load_settings():
-        """从 setting.ini 读取保存路径及串口设置"""
-        global save_path
+        """从 setting.ini 读取保存路径、串口设置及比例尺标定值"""
+        global save_path, pixels_per_mm
         config = configparser.ConfigParser()
         if os.path.exists(SETTINGS_FILE):
             config.read(SETTINGS_FILE, encoding='utf-8')
@@ -327,11 +461,18 @@ if __name__ == "__main__":
             saved_baud    = config.get('Serial', 'baud_rate', fallback='115200')
             saved_timeout = config.get('Serial', 'timeout',   fallback='1.0')
             saved_port    = config.get('Serial', 'port',      fallback='')
+            try:
+                pixels_per_mm = float(config.get('Scale', 'pixels_per_mm', fallback='100.0'))
+                if pixels_per_mm <= 0:
+                    pixels_per_mm = 100.0
+            except ValueError:
+                pixels_per_mm = 100.0
         else:
             save_path     = ''
             saved_baud    = '115200'
             saved_timeout = '1.0'
             saved_port    = ''
+            pixels_per_mm = 100.0
         _update_path_label()
         # 填充波特率下拉列表
         baud_rates = ['9600', '19200', '38400', '57600', '115200', '230400', '460800', '921600']
@@ -348,16 +489,23 @@ if __name__ == "__main__":
             if idx_port >= 0:
                 ui.cmbSerialPort.setCurrentIndex(idx_port)
         _update_serial_status()
+        # 恢复比例尺标定值到 UI
+        ui.edtPixelsPerMm.setText("{:.4f}".format(pixels_per_mm))
+        scale_overlay.set_pixels_per_mm(pixels_per_mm)
+        _update_scale_info_label()
         print("Settings loaded. Save path: '{}'".format(save_path or SCRIPT_DIR))
 
     def save_settings():
-        """将保存路径及串口设置写入 setting.ini"""
+        """将保存路径、串口设置及比例尺标定值写入 setting.ini"""
         config = configparser.ConfigParser()
         config['Settings'] = {'save_path': save_path}
         config['Serial'] = {
             'port':      ui.cmbSerialPort.currentText() if ui.cmbSerialPort.count() > 0 else '',
             'baud_rate': ui.cmbBaudRate.currentText(),
             'timeout':   ui.edtSerialTimeout.text().strip(),
+        }
+        config['Scale'] = {
+            'pixels_per_mm': str(pixels_per_mm),
         }
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
             config.write(f)
@@ -758,6 +906,58 @@ if __name__ == "__main__":
             return
         send_gcode("M106 S{}\n".format(value))
 
+    # ── 比例尺功能 ────────────────────────────────────────────────
+
+    def _poll_cam_img_width():
+        """采集开始后单次轮询，获取相机图像宽度供比例尺缩放使用。"""
+        global _cam_img_width
+        if obj_cam_operation and isGrabbing:
+            try:
+                _, w, _h = obj_cam_operation.Get_frame_numpy()
+                if w > 0:
+                    _cam_img_width = w
+                    scale_overlay.set_img_width(w)
+            except Exception:
+                pass
+
+    def _apply_scale_calib():
+        """读取 edtPixelsPerMm 输入，更新标定值并刷新叠加层。"""
+        global pixels_per_mm, _cam_img_width
+        try:
+            v = float(ui.edtPixelsPerMm.text().strip())
+            if v <= 0.0:
+                raise ValueError("非正数")
+        except ValueError:
+            QMessageBox.warning(mainWindow, "输入错误",
+                                "请输入有效的正数（像素/mm）。", QMessageBox.Ok)
+            return
+        pixels_per_mm = v
+        # 尝试获取当前帧图像宽度（用于计算显示缩放系数）
+        if obj_cam_operation and isGrabbing:
+            try:
+                _, w, _h = obj_cam_operation.Get_frame_numpy()
+                if w > 0:
+                    _cam_img_width = w
+                    scale_overlay.set_img_width(w)
+            except Exception:
+                pass
+        scale_overlay.set_pixels_per_mm(pixels_per_mm)
+        _update_scale_info_label()
+        save_settings()
+
+    def _toggle_scale_bar(state):
+        """复选框状态变化时切换叠加层可见性。"""
+        scale_overlay.set_visible(state == Qt.Checked)
+
+    def _update_scale_info_label():
+        """刷新状态标签：显示 1mm 对应像素数及每像素微米数。"""
+        if scale_overlay is None or pixels_per_mm <= 0:
+            ui.lblScaleBarInfo.setText("未标定")
+            return
+        info = "1mm={:.1f}px | {:.3f}µm/px".format(
+            pixels_per_mm, 1000.0 / pixels_per_mm)
+        ui.lblScaleBarInfo.setText(info)
+
     def get_param():
         ret = obj_cam_operation.Get_parameter()
         if ret != MV_OK:
@@ -812,6 +1012,12 @@ if __name__ == "__main__":
     mainWindow = QMainWindow()
     ui = Ui_MainWindow()
     ui.setupUi(mainWindow)
+
+    # 创建比例尺叠加层（必须在 setupUi 之后，widgetDisplay 已存在）
+    scale_overlay = ScaleBarOverlay(ui.widgetDisplay)
+    _resize_filter = _ResizeFilter(scale_overlay)
+    ui.widgetDisplay.installEventFilter(_resize_filter)
+
     ui.bnEnum.clicked.connect(enum_devices)
     ui.bnOpen.clicked.connect(open_device)
     ui.bnClose.clicked.connect(close_device)
@@ -835,6 +1041,8 @@ if __name__ == "__main__":
     ui.bnHomeZ.clicked.connect(action_home_z)
     ui.bnMoveStep.clicked.connect(action_move_z_step)
     ui.bnSetLight.clicked.connect(action_set_light)
+    ui.bnSetScaleCalib.clicked.connect(_apply_scale_calib)
+    ui.chkShowScaleBar.stateChanged.connect(_toggle_scale_bar)
 
     load_settings()
     mainWindow.show()

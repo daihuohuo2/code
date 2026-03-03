@@ -279,6 +279,39 @@ class Ui_MainWindow(object):
         motionGrid.setColumnStretch(2, 2)
 
         rightVLayout.addWidget(self.groupMotion)
+
+        # ── 比例尺组 ──
+        self.groupScaleBar = QtWidgets.QGroupBox(self.centralWidget)
+        self.groupScaleBar.setObjectName("groupScaleBar")
+        scaleGrid = QtWidgets.QGridLayout(self.groupScaleBar)
+        scaleGrid.setContentsMargins(10, 16, 10, 10)
+        scaleGrid.setSpacing(6)
+
+        self.chkShowScaleBar = QtWidgets.QCheckBox()
+        self.chkShowScaleBar.setObjectName("chkShowScaleBar")
+        scaleGrid.addWidget(self.chkShowScaleBar, 0, 0, 1, 2)
+
+        self.label_ppmm = QtWidgets.QLabel()
+        self.label_ppmm.setObjectName("label_ppmm")
+        scaleGrid.addWidget(self.label_ppmm, 1, 0)
+
+        self.edtPixelsPerMm = QtWidgets.QLineEdit()
+        self.edtPixelsPerMm.setObjectName("edtPixelsPerMm")
+        scaleGrid.addWidget(self.edtPixelsPerMm, 1, 1)
+
+        self.bnSetScaleCalib = QtWidgets.QPushButton()
+        self.bnSetScaleCalib.setObjectName("bnSetScaleCalib")
+        scaleGrid.addWidget(self.bnSetScaleCalib, 2, 0, 1, 2)
+
+        self.lblScaleBarInfo = QtWidgets.QLabel()
+        self.lblScaleBarInfo.setObjectName("lblScaleBarInfo")
+        self.lblScaleBarInfo.setAlignment(QtCore.Qt.AlignCenter)
+        scaleGrid.addWidget(self.lblScaleBarInfo, 3, 0, 1, 2)
+
+        scaleGrid.setColumnStretch(0, 2)
+        scaleGrid.setColumnStretch(1, 3)
+
+        rightVLayout.addWidget(self.groupScaleBar)
         rightVLayout.addStretch(1)   # 底部弹簧，让各组靠上排列
 
         # 右侧面板限制宽度
@@ -345,3 +378,10 @@ class Ui_MainWindow(object):
         self.bnAutoFocus.setText(_translate("MainWindow", "开始自动对焦"))
         self.bnStopAutoFocus.setText(_translate("MainWindow", "停止对焦"))
         self.lblAutoFocusStatus.setText(_translate("MainWindow", "就绪"))
+        # 比例尺
+        self.groupScaleBar.setTitle(_translate("MainWindow", "比例尺"))
+        self.chkShowScaleBar.setText(_translate("MainWindow", "显示比例尺"))
+        self.label_ppmm.setText(_translate("MainWindow", "像素/mm"))
+        self.edtPixelsPerMm.setText(_translate("MainWindow", "100.0"))
+        self.bnSetScaleCalib.setText(_translate("MainWindow", "应用标定值"))
+        self.lblScaleBarInfo.setText(_translate("MainWindow", ""))
