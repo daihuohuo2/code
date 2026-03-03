@@ -172,6 +172,498 @@ class _ResizeFilter(QObject):
         return False
 
 
+# ──────────────────────────────────────────────────────────────────
+#  三维重建 — 深度从焦点（Depth From Focus）点云重建对话框
+# ──────────────────────────────────────────────────────────────────
+
+def _get_mpl_font():
+    """返回支持中文显示的 matplotlib FontProperties（可选）"""
+    try:
+        from matplotlib.font_manager import FontProperties
+        for fname in ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 'Arial Unicode MS']:
+            try:
+                fp = FontProperties(family=fname)
+                return fp
+            except Exception:
+                continue
+        return FontProperties()
+    except Exception:
+        return None
+
+
+class PointCloudReconDialog(QDialog):
+    """
+    三维重建对话框（深度从焦点算法）
+
+    原理：
+      1. 控制 Z 轴从起始位置步进扫描到结束位置
+      2. 每步采集一帧，计算逐像素锐度（拉普拉斯平方）
+      3. 聚合各 Z 层锐度栈，取每像素最大锐度对应 Z 值为深度
+      4. 利用 pixels_per_mm 标定值将像素坐标转为物理坐标（mm）
+      5. 生成点云 (X_mm, Y_mm, Z_mm, Intensity)，可视化并导出
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("三维重建 — 点云数据重建")
+        self.setMinimumWidth(460)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinimizeButtonHint)
+        self._running = False
+        self._worker_thread = None
+        self._depth_map = None
+        self._point_cloud = None
+        self._img_size = (0, 0)
+        self._setup_ui()
+
+    # ── UI 构建 ───────────────────────────────────────────────
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # ── 扫描参数 ──────────────────────────────────────────
+        grp_scan = QGroupBox("扫描参数（Z 轴）")
+        form_scan = QFormLayout()
+        form_scan.setLabelAlignment(Qt.AlignRight)
+        self.edtZStart = QLineEdit("-2.0")
+        self.edtZEnd   = QLineEdit("2.0")
+        self.edtZStep  = QLineEdit("0.1")
+        self.edtDelay  = QLineEdit("0.15")
+        self.edtZStart.setToolTip("Z 轴扫描起始位置（mm，绝对坐标）")
+        self.edtZEnd  .setToolTip("Z 轴扫描结束位置（mm，绝对坐标）")
+        self.edtZStep .setToolTip("每步移动量（mm），建议 0.05 ~ 0.5mm")
+        self.edtDelay .setToolTip("每步移动后等待时间（秒），用于运动稳定")
+        form_scan.addRow("Z 起始位置 (mm):", self.edtZStart)
+        form_scan.addRow("Z 结束位置 (mm):", self.edtZEnd)
+        form_scan.addRow("Z 步长 (mm):",     self.edtZStep)
+        form_scan.addRow("每步延时 (s):",    self.edtDelay)
+        grp_scan.setLayout(form_scan)
+        layout.addWidget(grp_scan)
+
+        # ── 点云过滤参数 ──────────────────────────────────────
+        grp_pc = QGroupBox("点云参数")
+        form_pc = QFormLayout()
+        form_pc.setLabelAlignment(Qt.AlignRight)
+        self.edtZScale       = QLineEdit("1.0")
+        self.edtMinSharpness = QLineEdit("20.0")
+        self.edtZScale      .setToolTip("Z 轴方向缩放系数（1.0 = 不缩放）")
+        self.edtMinSharpness.setToolTip("最小锐度阈值，低于此值的像素将被过滤掉（去除背景噪点）")
+        form_pc.addRow("Z 轴缩放系数:",   self.edtZScale)
+        form_pc.addRow("最小锐度阈值:",  self.edtMinSharpness)
+        grp_pc.setLayout(form_pc)
+        layout.addWidget(grp_pc)
+
+        # ── 进度条与状态 ──────────────────────────────────────
+        self.progressBar = QProgressBar()
+        self.progressBar.setValue(0)
+        self.progressBar.setTextVisible(True)
+        layout.addWidget(self.progressBar)
+
+        self.lblStatus = QLabel("就绪 — 请确认相机已开启采集且串口已连接")
+        self.lblStatus.setWordWrap(True)
+        self.lblStatus.setStyleSheet("color: gray; padding: 2px;")
+        layout.addWidget(self.lblStatus)
+
+        # ── 操作按钮 ──────────────────────────────────────────
+        btn_row1 = QHBoxLayout()
+        self.bnStart = QPushButton("▶  开始重建")
+        self.bnStop  = QPushButton("■  停止")
+        self.bnStart.setMinimumHeight(32)
+        self.bnStop .setMinimumHeight(32)
+        self.bnStop .setEnabled(False)
+        btn_row1.addWidget(self.bnStart)
+        btn_row1.addWidget(self.bnStop)
+        layout.addLayout(btn_row1)
+
+        btn_row2 = QHBoxLayout()
+        self.bnVisualize = QPushButton("📊  可视化点云")
+        self.bnExport    = QPushButton("💾  导出点云")
+        self.bnVisualize.setMinimumHeight(30)
+        self.bnExport   .setMinimumHeight(30)
+        self.bnVisualize.setEnabled(False)
+        self.bnExport   .setEnabled(False)
+        btn_row2.addWidget(self.bnVisualize)
+        btn_row2.addWidget(self.bnExport)
+        layout.addLayout(btn_row2)
+
+        # ── 信号连接 ──────────────────────────────────────────
+        self.bnStart    .clicked.connect(self._start_reconstruction)
+        self.bnStop     .clicked.connect(self._stop_reconstruction)
+        self.bnVisualize.clicked.connect(self._visualize_point_cloud)
+        self.bnExport   .clicked.connect(self._export_point_cloud)
+
+    # ── 辅助 ─────────────────────────────────────────────────
+
+    def _set_status(self, msg, color="gray"):
+        self.lblStatus.setText(msg)
+        self.lblStatus.setStyleSheet(
+            "color: {}; padding: 2px;".format(color))
+
+    def _send_serial(self, cmd):
+        """线程安全串口发送（不弹窗，仅打印）"""
+        try:
+            if not is_serial_connected or serial_conn is None:
+                print("[Recon3D] 串口未连接，无法发送: {}".format(cmd.strip()))
+                return False
+            serial_conn.write(cmd.encode('utf-8'))
+            print("[Recon3D] >>", cmd.strip())
+            return True
+        except Exception as e:
+            print("[Recon3D] 串口发送异常:", e)
+            return False
+
+    # ── 重建控制 ──────────────────────────────────────────────
+
+    def _start_reconstruction(self):
+        """校验参数后启动重建后台线程"""
+        try:
+            z_start = float(self.edtZStart.text().strip())
+            z_end   = float(self.edtZEnd.text().strip())
+            z_step  = float(self.edtZStep.text().strip())
+            delay   = float(self.edtDelay.text().strip())
+            if z_step <= 0:
+                raise ValueError("步长必须为正数")
+            if z_start >= z_end:
+                raise ValueError("起始位置必须小于结束位置")
+            if delay < 0:
+                raise ValueError("延时不能为负数")
+            n_steps = int(round((z_end - z_start) / z_step)) + 1
+            if n_steps < 2:
+                raise ValueError("步数过少（{}步），请减小步长或增大扫描范围".format(n_steps))
+        except ValueError as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+            return
+
+        if not isGrabbing:
+            QMessageBox.warning(self, "错误", "请先开启相机采集！")
+            return
+        if not is_serial_connected:
+            QMessageBox.warning(self, "错误", "请先连接串口（用于控制 Z 轴运动）！")
+            return
+
+        reply = QMessageBox.question(
+            self, "确认",
+            "将扫描 Z 轴 {:.2f} → {:.2f} mm，步长 {:.3f} mm，共 {} 步。\n"
+            "确认开始？".format(z_start, z_end, z_step, n_steps),
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        self._running = True
+        self._depth_map   = None
+        self._point_cloud = None
+        self.bnStart    .setEnabled(False)
+        self.bnStop     .setEnabled(True)
+        self.bnVisualize.setEnabled(False)
+        self.bnExport   .setEnabled(False)
+        self.progressBar.setValue(0)
+        self._set_status("准备中…", "blue")
+
+        self._worker_thread = threading.Thread(
+            target=self._recon_worker,
+            args=(z_start, z_end, z_step, delay),
+            daemon=True)
+        self._worker_thread.start()
+
+    def _stop_reconstruction(self):
+        self._running = False
+        self._set_status("停止请求已发送，等待当前步完成…", "orange")
+
+    # ── 核心重建后台线程 ──────────────────────────────────────
+
+    def _recon_worker(self, z_start, z_end, z_step, delay):
+        """
+        深度从焦点（Depth From Focus）三维重建后台线程
+
+        步骤：
+          1. 移动到 Z 起始位置
+          2. 逐步扫描 Z 轴采集锐度栈
+          3. 每像素取最大锐度对应 Z 值生成深度图
+          4. 利用 pixels_per_mm 将像素坐标转换为物理坐标（mm）
+          5. 过滤低锐度点后生成并存储点云
+        """
+        try:
+            import numpy as np
+        except ImportError:
+            QTimer.singleShot(0, lambda: QMessageBox.critical(
+                self, "依赖缺失", "三维重建需要 numpy:\npip install numpy"))
+            self._running = False
+            QTimer.singleShot(0, self._on_worker_done)
+            return
+
+        def set_status(msg, color="blue"):
+            QTimer.singleShot(0, lambda m=msg, c=color: self._set_status(m, c))
+
+        def set_progress(v):
+            QTimer.singleShot(0, lambda val=v: self.progressBar.setValue(val))
+
+        try:
+            n_steps = int(round((z_end - z_start) / z_step)) + 1
+            z_positions = [z_start + i * z_step for i in range(n_steps)]
+
+            # ── 移动到起始 Z 位置 ─────────────────────────────
+            set_status("移动到起始位置 Z={:.3f} mm…".format(z_start))
+            print("[Recon3D] ===== 三维重建开始 =====")
+            print("[Recon3D] 扫描范围: {:.3f} ~ {:.3f} mm, 步长 {:.3f} mm, {} 步".format(
+                z_start, z_end, z_step, n_steps))
+
+            if not self._send_serial("G90\n"):
+                set_status("错误：无法发送归位指令（G90）", "red"); return
+            if not self._send_serial("G1 Z{:.4f} F300\n".format(z_start)):
+                set_status("错误：无法移动到起始位置", "red"); return
+            # 等待运动完成
+            wait = max(0.8, abs(z_start) / 5.0 + 0.4)
+            time.sleep(wait)
+
+            # ── 获取图像尺寸 ───────────────────────────────────
+            set_status("探测图像尺寸…")
+            data0, w, h = obj_cam_operation.Get_frame_numpy()
+            if data0 is None or w == 0 or h == 0:
+                set_status("错误：无法获取相机帧，请检查相机是否正在输出图像", "red")
+                return
+            print("[Recon3D] 图像尺寸: {}×{}".format(w, h))
+
+            # ── 分配锐度栈与强度栈 ─────────────────────────────
+            sharpness_stack = np.zeros((n_steps, h, w), dtype=np.float32)
+            intensity_stack  = np.zeros((n_steps, h, w), dtype=np.float32)
+
+            # ── 逐步扫描 ───────────────────────────────────────
+            for idx, z_pos in enumerate(z_positions):
+                if not self._running:
+                    set_status("已停止", "orange")
+                    return
+
+                # 从第二步开始相对步进
+                if idx > 0:
+                    if not self._send_serial("G91\n"):
+                        set_status("错误：G91 发送失败", "red"); return
+                    if not self._send_serial("G1 Z{:.4f} F300\n".format(z_step)):
+                        set_status("错误：步进移动失败", "red"); return
+                    if not self._send_serial("G90\n"):
+                        set_status("错误：G90 发送失败", "red"); return
+                    time.sleep(delay)
+
+                set_status("扫描 Z={:.3f} mm  ({}/{})".format(z_pos, idx + 1, n_steps))
+
+                # 采集帧
+                data, fw, fh = obj_cam_operation.Get_frame_numpy()
+                if data is not None and fw == w and fh == h and len(data) >= w * h:
+                    gray = data[:w * h].reshape(h, w).astype(np.float32)
+
+                    # 拉普拉斯锐度图（平方保证非负）
+                    lap = (gray[:-2, 1:-1] + gray[2:, 1:-1] +
+                           gray[1:-1, :-2] + gray[1:-1, 2:] -
+                           4.0 * gray[1:-1, 1:-1])
+                    sharp_map = np.zeros((h, w), dtype=np.float32)
+                    sharp_map[1:-1, 1:-1] = lap * lap   # L²
+                    sharpness_stack[idx] = sharp_map
+                    intensity_stack[idx] = gray
+                else:
+                    print("[Recon3D] [警告] 第 {} 步帧获取失败，跳过".format(idx + 1))
+
+                set_progress(int((idx + 1) / n_steps * 80))
+
+            if not self._running:
+                set_status("已停止", "orange")
+                return
+
+            # ── 生成深度图 ─────────────────────────────────────
+            set_status("生成深度图…")
+            set_progress(82)
+
+            # 每像素最大锐度对应的 Z 层索引
+            best_z_idx  = np.argmax(sharpness_stack, axis=0)   # (h, w)
+            best_sharp  = np.max(sharpness_stack, axis=0)       # (h, w)
+            z_arr       = np.array(z_positions, dtype=np.float32)
+            depth_map   = z_arr[best_z_idx]                     # (h, w), mm
+
+            # 取该位置对应层的灰度作为点强度
+            row_idx, col_idx = np.indices((h, w))
+            best_intensity = intensity_stack[best_z_idx, row_idx, col_idx]
+
+            set_progress(88)
+
+            # ── 生成点云 ───────────────────────────────────────
+            set_status("生成点云…")
+
+            try:
+                min_sharp = float(self.edtMinSharpness.text().strip())
+                if min_sharp < 0:
+                    min_sharp = 0.0
+            except ValueError:
+                min_sharp = 20.0
+            try:
+                z_scale = float(self.edtZScale.text().strip())
+            except ValueError:
+                z_scale = 1.0
+
+            valid_mask = best_sharp > min_sharp
+
+            # 像素坐标 → 物理坐标（mm），以图像中心为原点
+            ppmm = pixels_per_mm if pixels_per_mm > 0 else 1.0
+            ys, xs = np.where(valid_mask)
+            x_mm  = (xs.astype(np.float32) - w / 2.0) / ppmm
+            y_mm  = (ys.astype(np.float32) - h / 2.0) / ppmm
+            z_mm  = depth_map[ys, xs] * z_scale
+            intensity_vals = best_intensity[ys, xs]
+
+            point_cloud = np.column_stack(
+                [x_mm, y_mm, z_mm, intensity_vals]).astype(np.float32)
+
+            self._depth_map   = depth_map
+            self._point_cloud = point_cloud
+            self._img_size    = (w, h)
+
+            set_progress(100)
+            n_pts = len(point_cloud)
+            coverage = 100.0 * n_pts / (w * h) if (w * h) > 0 else 0.0
+            msg = ("重建完成 ✓   点数: {:,}   像素覆盖率: {:.1f}%\n"
+                   "pixels/mm={:.2f}  分辨率: {}×{}".format(
+                       n_pts, coverage, ppmm, w, h))
+            set_status(msg, "green")
+            print("[Recon3D] 完成: {:,} 点, {}×{} 像素, 覆盖率 {:.1f}%".format(
+                n_pts, w, h, coverage))
+
+            QTimer.singleShot(0, lambda: self.bnVisualize.setEnabled(True))
+            QTimer.singleShot(0, lambda: self.bnExport.setEnabled(True))
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QTimer.singleShot(0, lambda err=str(e): self._set_status(
+                "重建失败: " + err, "red"))
+        finally:
+            self._running = False
+            QTimer.singleShot(0, self._on_worker_done)
+
+    def _on_worker_done(self):
+        self.bnStart.setEnabled(True)
+        self.bnStop .setEnabled(False)
+
+    # ── 可视化 ────────────────────────────────────────────────
+
+    def _visualize_point_cloud(self):
+        """使用 matplotlib 在新窗口中显示深度图和三维点云散点图"""
+        if self._point_cloud is None or len(self._point_cloud) == 0:
+            QMessageBox.warning(self, "提示", "暂无点云数据，请先执行重建。")
+            return
+        try:
+            import numpy as np
+            import matplotlib
+            matplotlib.use('Qt5Agg')
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+            pc = self._point_cloud
+            x, y, z, intensity = pc[:, 0], pc[:, 1], pc[:, 2], pc[:, 3]
+            fp = _get_mpl_font()
+
+            fig = plt.figure(figsize=(14, 6))
+            title_kw = {'fontproperties': fp} if fp else {}
+            fig.suptitle("三维重建结果 — 点云数据", fontsize=14, **title_kw)
+
+            # 左图：深度图（热力图）
+            ax1 = fig.add_subplot(1, 2, 1)
+            if self._depth_map is not None:
+                w, h = self._img_size
+                im = ax1.imshow(self._depth_map, cmap='plasma',
+                                origin='upper',
+                                extent=[-w / (2 * pixels_per_mm),
+                                        w / (2 * pixels_per_mm),
+                                        h / (2 * pixels_per_mm),
+                                        -h / (2 * pixels_per_mm)])
+                cb = plt.colorbar(im, ax=ax1)
+                cb.set_label('Depth (mm)')
+                ax1.set_title("Depth Map", **title_kw)
+                ax1.set_xlabel("X (mm)")
+                ax1.set_ylabel("Y (mm)")
+
+            # 右图：三维点云
+            ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+            # 降采样以提高渲染速度（最多显示 60000 点）
+            MAX_PLOT = 60000
+            if len(x) > MAX_PLOT:
+                idx = np.random.choice(len(x), MAX_PLOT, replace=False)
+                xp, yp, zp, ip = x[idx], y[idx], z[idx], intensity[idx]
+            else:
+                xp, yp, zp, ip = x, y, z, intensity
+
+            sc = ax2.scatter(xp, yp, zp, c=ip, cmap='gray', s=0.5, alpha=0.6)
+            plt.colorbar(sc, ax=ax2, label='Intensity')
+            ax2.set_xlabel("X (mm)")
+            ax2.set_ylabel("Y (mm)")
+            ax2.set_zlabel("Z (mm)")
+            ax2.set_title("Point Cloud ({:,} pts)".format(len(x)), **title_kw)
+
+            plt.tight_layout()
+            plt.show()
+
+        except ImportError:
+            QMessageBox.warning(self, "依赖缺失",
+                                "可视化需要 matplotlib:\n"
+                                "pip install matplotlib")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(self, "可视化错误", str(e))
+
+    # ── 导出 ──────────────────────────────────────────────────
+
+    def _export_point_cloud(self):
+        """将点云导出为 .ply（ASCII）或 .csv 文件"""
+        if self._point_cloud is None or len(self._point_cloud) == 0:
+            QMessageBox.warning(self, "提示", "暂无点云数据，请先执行重建。")
+            return
+
+        default_name = "pointcloud_{}.ply".format(
+            datetime.now().strftime("%Y%m%d_%H%M%S"))
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出点云",
+            os.path.join(get_effective_save_path(), default_name),
+            "PLY 文件 (*.ply);;CSV 文件 (*.csv);;全部文件 (*.*)")
+        if not file_path:
+            return
+
+        try:
+            pc = self._point_cloud
+            n_pts = len(pc)
+
+            if file_path.lower().endswith('.csv'):
+                import csv
+                with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['x_mm', 'y_mm', 'z_mm', 'intensity'])
+                    writer.writerows(pc.tolist())
+                QMessageBox.information(
+                    self, "导出完成",
+                    "已导出 {:,} 个点（CSV 格式）\n{}".format(n_pts, file_path))
+            else:
+                # PLY ASCII 格式（兼容 MeshLab / CloudCompare / Open3D）
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write("ply\n")
+                    f.write("format ascii 1.0\n")
+                    f.write("comment Generated by BasicDemo 3D Reconstruction\n")
+                    f.write("comment pixels_per_mm={:.4f}\n".format(pixels_per_mm))
+                    f.write("element vertex {}\n".format(n_pts))
+                    f.write("property float x\n")
+                    f.write("property float y\n")
+                    f.write("property float z\n")
+                    f.write("property float intensity\n")
+                    f.write("end_header\n")
+                    for row in pc:
+                        f.write("{:.6f} {:.6f} {:.6f} {:.2f}\n".format(
+                            float(row[0]), float(row[1]),
+                            float(row[2]), float(row[3])))
+                QMessageBox.information(
+                    self, "导出完成",
+                    "已导出 {:,} 个点（PLY 格式）\n"
+                    "支持 MeshLab / CloudCompare / Open3D 打开\n{}".format(
+                        n_pts, file_path))
+            print("[Recon3D] 点云已导出: {}".format(file_path))
+        except Exception as e:
+            QMessageBox.warning(self, "导出错误", str(e))
+
+
 if __name__ == "__main__":
 
     # ch:初始化SDK | en: initialize SDK
@@ -211,6 +703,8 @@ if __name__ == "__main__":
     scale_overlay = None
     global _cam_img_width          # 最近一帧的相机图像宽度（用于显示缩放比）
     _cam_img_width = 0
+    global _recon3d_dialog            # 三维重建对话框（单例，懒加载）
+    _recon3d_dialog = None
 
     # 脚本所在目录作为默认保存路径
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1275,6 +1769,44 @@ if __name__ == "__main__":
     ui.bnSetLight.clicked.connect(action_set_light)
     ui.bnSetScaleCalib.clicked.connect(_apply_scale_calib)
     ui.bnAutoCalib.clicked.connect(start_auto_calib)
+
+    # ── 三维重建菜单 ──────────────────────────────────────────────────
+    def open_recon3d_dialog():
+        """打开（或激活已存在的）三维重建对话框"""
+        global _recon3d_dialog
+        if _recon3d_dialog is None:
+            _recon3d_dialog = PointCloudReconDialog(mainWindow)
+        _recon3d_dialog.show()
+        _recon3d_dialog.raise_()
+        _recon3d_dialog.activateWindow()
+
+    menubar = mainWindow.menuBar()
+    menu_recon = menubar.addMenu("三维重建(&3D)")
+    act_open_recon = menu_recon.addAction("打开点云重建窗口…")
+    act_open_recon.setToolTip("基于深度从焦点（Depth From Focus）算法重建三维点云")
+    act_open_recon.triggered.connect(open_recon3d_dialog)
+    menu_recon.addSeparator()
+    act_help = menu_recon.addAction("使用说明")
+    act_help.triggered.connect(lambda: QMessageBox.information(
+        mainWindow, "三维重建使用说明",
+        "【三维重建 — 深度从焦点算法】\n\n"
+        "原理：\n"
+        "  通过逐步移动 Z 轴，在每个 Z 位置采集一帧图像，\n"
+        "  计算每个像素的清晰度（拉普拉斯算子平方），\n"
+        "  找出每个像素清晰度最高时对应的 Z 值作为该点的深度，\n"
+        "  最终利用相机标定值（pixels/mm）将像素坐标转换为\n"
+        "  物理坐标（mm），生成三维点云。\n\n"
+        "使用步骤：\n"
+        "  1. 打开相机并开始采集\n"
+        "  2. 连接串口（用于 G-code 控制 Z 轴）\n"
+        "  3. 在比例尺标定中设置好 pixels/mm\n"
+        "  4. 打开此窗口，设置 Z 扫描范围和步长\n"
+        "  5. 点击「开始重建」等待扫描完成\n"
+        "  6. 可视化查看深度图和点云，或导出 .ply/.csv 文件\n\n"
+        "提示：\n"
+        "  • Z 步长越小精度越高，耗时越长\n"
+        "  • 建议先用大步长粗扫再缩小范围细扫\n"
+        "  • 导出的 .ply 文件可用 MeshLab / CloudCompare / Open3D 打开"))
     ui.bnCaptureDark.clicked.connect(capture_dark_frame)
     ui.chkDarkSub.stateChanged.connect(toggle_dark_sub)
     ui.bnClearDark.clicked.connect(clear_dark_frame)
