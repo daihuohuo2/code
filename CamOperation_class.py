@@ -108,6 +108,8 @@ class CameraOperation:
         self.exposure_time = exposure_time
         self.gain = gain
         self.buf_lock = threading.Lock()  # 取图和存图的buffer锁
+        self.dark_frame = None        # 底噪帧（numpy int16 一维数组，与图像相同长度）
+        self.apply_dark_sub = False   # 是否启用底噪扣除
 
     # 打开相机
     def Open_device(self):
@@ -312,6 +314,24 @@ class CameraOperation:
 
                 print("get one frame: Width[%d], Height[%d], nFrameNum[%d]"
                       % (self.st_frame_info.nWidth, self.st_frame_info.nHeight, self.st_frame_info.nFrameNum))
+
+                # ── 底噪扣除 ──────────────────────────────────────────
+                if self.apply_dark_sub and self.dark_frame is not None:
+                    try:
+                        import numpy as np
+                        frame_len = self.st_frame_info.nFrameLen
+                        if len(self.dark_frame) == frame_len:
+                            raw = np.frombuffer(self.buf_save_image,
+                                                dtype=np.uint8, count=frame_len)
+                            result = np.clip(
+                                raw.astype(np.int16) - self.dark_frame,
+                                0, 255).astype(np.uint8)
+                            ctypes.memmove(self.buf_save_image,
+                                           result.ctypes.data, frame_len)
+                    except Exception as _e:
+                        print("[DarkSub] error:", _e)
+                # ────────────────────────────────────────────────────
+
                 # 释放缓存
                 self.obj_cam.MV_CC_FreeImageBuffer(stOutFrame)
             else:

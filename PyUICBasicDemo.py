@@ -341,6 +341,39 @@ class Ui_MainWindow(object):
         scaleGrid.setColumnStretch(1, 3)
 
         rightVLayout.addWidget(self.groupScaleBar)
+
+        # ── 底噪扣除组 ──
+        self.groupDarkSub = QtWidgets.QGroupBox(self.centralWidget)
+        self.groupDarkSub.setObjectName("groupDarkSub")
+        darkGrid = QtWidgets.QGridLayout(self.groupDarkSub)
+        darkGrid.setContentsMargins(10, 16, 10, 10)
+        darkGrid.setSpacing(6)
+
+        self.bnCaptureDark = QtWidgets.QPushButton()
+        self.bnCaptureDark.setObjectName("bnCaptureDark")
+        self.bnCaptureDark.setEnabled(False)
+        darkGrid.addWidget(self.bnCaptureDark, 0, 0, 1, 2)
+
+        self.chkDarkSub = QtWidgets.QCheckBox()
+        self.chkDarkSub.setObjectName("chkDarkSub")
+        self.chkDarkSub.setEnabled(False)
+        darkGrid.addWidget(self.chkDarkSub, 1, 0, 1, 2)
+
+        self.bnClearDark = QtWidgets.QPushButton()
+        self.bnClearDark.setObjectName("bnClearDark")
+        self.bnClearDark.setEnabled(False)
+        darkGrid.addWidget(self.bnClearDark, 2, 0, 1, 2)
+
+        self.lblDarkSubStatus = QtWidgets.QLabel()
+        self.lblDarkSubStatus.setObjectName("lblDarkSubStatus")
+        self.lblDarkSubStatus.setAlignment(QtCore.Qt.AlignCenter)
+        self.lblDarkSubStatus.setWordWrap(True)
+        darkGrid.addWidget(self.lblDarkSubStatus, 3, 0, 1, 2)
+
+        darkGrid.setColumnStretch(0, 1)
+        darkGrid.setColumnStretch(1, 1)
+
+        rightVLayout.addWidget(self.groupDarkSub)
         rightVLayout.addStretch(1)   # 底部弹簧，让各组靠上排列
 
         # 右侧面板限制宽度
@@ -420,3 +453,9 @@ class Ui_MainWindow(object):
         self.edtCalibMoveMm.setText(_translate("MainWindow", "1.0"))
         self.bnAutoCalib.setText(_translate("MainWindow", "自动标定"))
         self.lblAutoCalibStatus.setText(_translate("MainWindow", "就绪"))
+        # 底噪扣除
+        self.groupDarkSub.setTitle(_translate("MainWindow", "底噪扣除"))
+        self.bnCaptureDark.setText(_translate("MainWindow", "采集底噪帧"))
+        self.chkDarkSub.setText(_translate("MainWindow", "启用底噪扣除"))
+        self.bnClearDark.setText(_translate("MainWindow", "清除底噪帧"))
+        self.lblDarkSubStatus.setText(_translate("MainWindow", "未采集"))

@@ -199,6 +199,8 @@ if __name__ == "__main__":
     autofocus_running = False
     global auto_calib_running
     auto_calib_running = False
+    global dark_frame_captured
+    dark_frame_captured = False
     global serial_conn
     serial_conn = None
     global is_serial_connected
@@ -1077,6 +1079,74 @@ if __name__ == "__main__":
             auto_calib_running = False
             QTimer.singleShot(0, lambda: ui.bnAutoCalib.setEnabled(True))
 
+    # ── 底噪扣除 ──────────────────────────────────────────────
+
+    def capture_dark_frame():
+        """采集当前帧作为底噪（暗帧），存入 obj_cam_operation.dark_frame"""
+        global dark_frame_captured
+        if not isGrabbing:
+            QMessageBox.warning(mainWindow, "错误", "请先开始采集！", QMessageBox.Ok)
+            return
+        try:
+            import numpy as np
+            data, w, h = obj_cam_operation.Get_frame_numpy()
+            if data is None or w == 0 or h == 0:
+                QMessageBox.warning(mainWindow, "错误",
+                                    "无法获取当前帧，请确认相机正在输出图像。",
+                                    QMessageBox.Ok)
+                return
+            frame_len = w * h  # Mono8/Bayer8
+            if len(data) < frame_len:
+                QMessageBox.warning(mainWindow, "错误",
+                                    "帧数据长度不匹配（{} < {}*{}）。".format(
+                                        len(data), w, h), QMessageBox.Ok)
+                return
+            # 取前 w*h 字节（支持 Mono8 / BayerXX8）
+            dark = data[:frame_len].astype(np.int16)
+            # 存入完整帧长度（SDK 帧长度可能包含额外对齐字节）
+            full_dark = data.astype(np.int16)   # 长度 = nFrameLen
+            obj_cam_operation.dark_frame = full_dark
+            dark_frame_captured = True
+            ui.chkDarkSub.setEnabled(True)
+            ui.bnClearDark.setEnabled(True)
+            mean_val = float(np.mean(dark))
+            ui.lblDarkSubStatus.setText(
+                "帧大小: {}x{}\n均值: {:.1f}\n底噪帧已就绪".format(w, h, mean_val))
+            print("[DarkSub] 底噪帧已采集: {}x{}, 均值={:.1f}".format(w, h, mean_val))
+        except Exception as e:
+            print("[DarkSub] 采集异常:", e)
+            QMessageBox.warning(mainWindow, "错误",
+                                "采集底噪帧失败:\n" + str(e), QMessageBox.Ok)
+
+    def toggle_dark_sub(state):
+        """复选框状态变化时切换底噪扣除开关"""
+        if obj_cam_operation and isGrabbing:
+            enabled = (state == Qt.Checked)
+            obj_cam_operation.apply_dark_sub = enabled
+            _update_dark_sub_status_label(dark_frame_captured, enabled)
+            print("[DarkSub] 底噪扣除{}".format("已启用" if enabled else "已禁用"))
+    def _update_dark_sub_status_label(captured, enabled):
+        """^统一刷新底噪状态标签"""
+        if not captured:
+            ui.lblDarkSubStatus.setText("未采集")
+        elif enabled:
+            ui.lblDarkSubStatus.setText("底噪帧已就绪\n已开启 ✔")
+        else:
+            ui.lblDarkSubStatus.setText("底噪帧已就绪\n未开启")
+
+    def clear_dark_frame():
+        """清除底噪帧并禁用扣除"""
+        global dark_frame_captured
+        if obj_cam_operation:
+            obj_cam_operation.dark_frame = None
+            obj_cam_operation.apply_dark_sub = False
+        dark_frame_captured = False
+        ui.chkDarkSub.setChecked(False)
+        ui.chkDarkSub.setEnabled(False)
+        ui.bnClearDark.setEnabled(False)
+        ui.lblDarkSubStatus.setText("未采集")
+        print("[DarkSub] 底噪帧已清除")
+
     def start_auto_calib():
         """读取 UI 输入并启动自动标定线程"""
         global auto_calib_running
@@ -1162,6 +1232,12 @@ if __name__ == "__main__":
         ui.bnAutoFocus.setEnabled(isOpen and isGrabbing and not autofocus_running)
         ui.bnStopAutoFocus.setEnabled(autofocus_running)
         ui.bnAutoCalib.setEnabled(isOpen and isGrabbing and not auto_calib_running)
+        ui.bnCaptureDark.setEnabled(isOpen and isGrabbing)
+        if not (isOpen and isGrabbing):
+            # 停止采集时同时禁用扣除，但保留已采集帧的按钮状态
+            if obj_cam_operation:
+                obj_cam_operation.apply_dark_sub = False
+            ui.chkDarkSub.setChecked(False)
 
     # ch: 初始化app, 绑定控件与函数 | en: Init app, bind ui and api
     app = QApplication(sys.argv)
@@ -1199,6 +1275,9 @@ if __name__ == "__main__":
     ui.bnSetLight.clicked.connect(action_set_light)
     ui.bnSetScaleCalib.clicked.connect(_apply_scale_calib)
     ui.bnAutoCalib.clicked.connect(start_auto_calib)
+    ui.bnCaptureDark.clicked.connect(capture_dark_frame)
+    ui.chkDarkSub.stateChanged.connect(toggle_dark_sub)
+    ui.bnClearDark.clicked.connect(clear_dark_frame)
     ui.chkShowScaleBar.stateChanged.connect(_toggle_scale_bar)
 
     load_settings()
