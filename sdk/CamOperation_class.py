@@ -11,7 +11,9 @@ from ctypes import *
 
 currentsystem = platform.system()
 if currentsystem == 'Windows':
-    sys.path.append(os.path.join(os.getenv('MVCAM_COMMON_RUNENV'), "Samples", "Python", "MvImport"))
+    _mvcam_env = os.getenv('MVCAM_COMMON_RUNENV')
+    if _mvcam_env:
+        sys.path.append(os.path.join(_mvcam_env, "Samples", "Python", "MvImport"))
 else:
     sys.path.append(os.path.join("..", "..", "MvImport"))
 
