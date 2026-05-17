@@ -3,7 +3,8 @@ import threading
 import time
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, pyqtSignal
+import numpy as np
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -22,10 +23,13 @@ from PyQt5.QtWidgets import (
 
 from algorithms import (
     build_best_focus_maps,
+    build_best_focus_color_maps,
     export_point_cloud,
     get_mpl_font,
     merge_focus_maps,
     point_cloud_from_depth,
+    save_output_bundle,
+    select_best_single_frame,
     select_focus_window,
 )
 
@@ -47,25 +51,68 @@ class TemporalDepthDialog(QDialog):
         self._worker = None
         self._depth_map = None
         self._sharp_map = None
+        self._intensity_map = None
         self._pc = None
         self._img_size = (0, 0)
+        self._last_output_paths = {}
         self._setup_ui()
         self._sig_status.connect(self._on_status)
         self._sig_progress.connect(self.progressBar.setValue)
         self._sig_log.connect(self._append_log)
         self._sig_done.connect(self._on_done)
+        self._z_timer = QTimer(self)
+        self._z_timer.timeout.connect(self._refresh_z_label)
+        self._z_timer.start(200)
+
+    def _refresh_z_label(self):
+        z = self.device_controller._z_position
+        min_limit = getattr(self.device_controller, "_z_min_limit", 0.0)
+        max_limit = getattr(self.device_controller, "_z_soft_limit", 68.0)
+        self.lblZPos.setText(
+            "Z 当前位置: {:.3f} mm    最低提醒: {:.1f} mm    最高提醒: {:.1f} mm".format(
+                z, min_limit, max_limit
+            )
+        )
+        color = (
+            "#ff3333" if z <= min_limit or z >= max_limit
+            else "#ffb000" if z <= min_limit + 1.0 or z >= max_limit - 5.0
+            else "#00aaff"
+        )
+        self.lblZPos.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: {};"
+            "background: #ffffff; border: 1px solid {}; border-radius: 4px; padding: 4px;".format(color, color)
+        )
+
+    def sync_z_inputs_to_current(self):
+        z = float(self.device_controller._z_position)
+        try:
+            span = abs(float(self.edtZ1.text().strip()) - float(self.edtZ0.text().strip()))
+        except ValueError:
+            span = 4.0
+        span = max(0.1, span)
+        self.edtZ0.setText("{:.3f}".format(z))
+        self.edtZ1.setText("{:.3f}".format(z + span))
+        self._refresh_z_label()
 
     def _setup_ui(self):
         root = QVBoxLayout(self)
         root.setSpacing(6)
+
+        self.lblZPos = QLabel("Z 当前位置: -- mm")
+        self.lblZPos.setAlignment(Qt.AlignCenter)
+        self.lblZPos.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #0078d7;"
+            "background: #ffffff; border: 1px solid #0078d7; border-radius: 4px; padding: 4px;"
+        )
+        root.addWidget(self.lblZPos)
 
         grp1 = QGroupBox("第一轮：粗扫参数（连续匀速扫描）")
         form1 = QFormLayout()
         form1.setLabelAlignment(Qt.AlignRight)
         self.edtZ0 = QLineEdit("-2.0")
         self.edtZ1 = QLineEdit("2.0")
-        self.edtSpeed = QLineEdit("1.0")
-        self.edtItvMs = QLineEdit("80")
+        self.edtSpeed = QLineEdit("2.0")
+        self.edtItvMs = QLineEdit("120")
         form1.addRow("Z 起始 (mm):", self.edtZ0)
         form1.addRow("Z 结束 (mm):", self.edtZ1)
         form1.addRow("扫描速度 (mm/s):", self.edtSpeed)
@@ -77,10 +124,10 @@ class TemporalDepthDialog(QDialog):
         form2 = QFormLayout()
         form2.setLabelAlignment(Qt.AlignRight)
         self.chkNested = QCheckBox("启用嵌套精扫（粗扫结束后自动执行）")
-        self.chkNested.setChecked(True)
-        self.edtFineSpeed = QLineEdit("0.3")
-        self.edtFineItvMs = QLineEdit("50")
-        self.edtFinePct = QLineEdit("30")
+        self.chkNested.setChecked(False)
+        self.edtFineSpeed = QLineEdit("0.8")
+        self.edtFineItvMs = QLineEdit("80")
+        self.edtFinePct = QLineEdit("20")
         form2.addRow(self.chkNested)
         form2.addRow("精扫速度 (mm/s):", self.edtFineSpeed)
         form2.addRow("精扫采帧间隔 (ms):", self.edtFineItvMs)
@@ -91,9 +138,9 @@ class TemporalDepthDialog(QDialog):
         grp3 = QGroupBox("点云参数")
         form3 = QFormLayout()
         form3.setLabelAlignment(Qt.AlignRight)
-        self.edtMinSharp = QLineEdit("10.0")
+        self.edtMinSharp = QLineEdit("5.0")
         self.edtZScale = QLineEdit("1.0")
-        form3.addRow("最小锐度阈值:", self.edtMinSharp)
+        form3.addRow("最小锐度(%, 0-100):", self.edtMinSharp)
         form3.addRow("Z 轴缩放系数:", self.edtZScale)
         grp3.setLayout(form3)
         root.addWidget(grp3)
@@ -111,6 +158,19 @@ class TemporalDepthDialog(QDialog):
         self.txtLog.setReadOnly(True)
         self.txtLog.setMaximumHeight(120)
         root.addWidget(self.txtLog)
+
+        # ── 保存路径 ──
+        save_row = QHBoxLayout()
+        save_row.addWidget(QLabel("保存路径:"))
+        self._edt_save_path = QLineEdit(self.config_manager.effective_save_path())
+        self._edt_save_path.setReadOnly(True)
+        self._edt_save_path.setStyleSheet("font-size: 10px; color: #555;")
+        self._btn_browse_save = QPushButton("浏览...")
+        self._btn_browse_save.setMaximumWidth(60)
+        self._btn_browse_save.clicked.connect(self._browse_save_path)
+        save_row.addWidget(self._edt_save_path, stretch=1)
+        save_row.addWidget(self._btn_browse_save)
+        root.addLayout(save_row)
 
         row1 = QHBoxLayout()
         self.bnStart = QPushButton("开始扫描")
@@ -133,6 +193,12 @@ class TemporalDepthDialog(QDialog):
         self.bnStop.clicked.connect(self._stop)
         self.bnViz.clicked.connect(self._visualize)
         self.bnExport.clicked.connect(self._export)
+
+    def _browse_save_path(self):
+        path = QFileDialog.getExistingDirectory(self, "选择保存路径", self.config_manager.effective_save_path())
+        if path:
+            self.config_manager.save_path = path
+            self._edt_save_path.setText(path)
 
     def _on_status(self, message, color):
         self.lblStatus.setText(message)
@@ -227,7 +293,9 @@ class TemporalDepthDialog(QDialog):
         self._running = True
         self._depth_map = None
         self._sharp_map = None
+        self._intensity_map = None
         self._pc = None
+        self._last_output_paths = {}
         self.bnStart.setEnabled(False)
         self.bnStop.setEnabled(True)
         self.bnViz.setEnabled(False)
@@ -255,28 +323,26 @@ class TemporalDepthDialog(QDialog):
     def _do_sweep(self, z0, z1, speed, itv, label="粗扫"):
         sweep_s = abs(z1 - z0) / speed
         self._sig_status.emit("{} - 移动到起始 Z={:.3f}mm...".format(label, z0), "blue")
-        self.device_controller.move_z_absolute(z0, feed=300)
+        self.device_controller.move_z_absolute_wait(z0, feed=300)
 
-        wait = max(0.8, abs(z0) / 5.0 + 0.5)
-        start_wait = time.time()
-        while time.time() - start_wait < wait:
-            if not self._running:
-                return None, None
-            time.sleep(0.05)
+        if not self._running:
+            return None, None, None
+        time.sleep(0.1)
 
-        gray0, width, height = self.device_controller.get_gray_frame()
+        gray0, color0, width, height = self.device_controller.get_gray_color_frame()
         if gray0 is None or width == 0 or height == 0:
             self._sig_status.emit("错误：无法获取相机帧", "red")
-            return None, None
-        self._sig_log.emit("  图像尺寸 {}x{}".format(width, height))
+            return None, None, None
+            self._sig_log.emit("尺寸：{}x{}".format(width, height))
 
         self._sig_status.emit("{} - Z 轴开始匀速扫描，速度 {:.2f} mm/s...".format(label, speed), "blue")
-        sweep_dist = z1 - z0
-        self._gcode("G1 Z{:.4f} F{:.1f}\n".format(sweep_dist, speed * 60.0))
+        command_z1 = z1 + getattr(self.device_controller, "_z_origin_offset", 0.0)
+        self._gcode("G90\nG1 Z{:.4f} F{:.1f}\n".format(command_z1, speed * 60.0))
 
         t_start = time.time()
         next_cap = t_start
         frames_gray = []
+        frames_color = []
         z_list = []
         z_est = z0
 
@@ -285,9 +351,10 @@ class TemporalDepthDialog(QDialog):
             elapsed = now - t_start
             z_est = z0 + (z1 - z0) * min(elapsed / sweep_s, 1.0)
             if now >= next_cap:
-                gray, frame_w, frame_h = self.device_controller.get_gray_frame()
+                gray, color, frame_w, frame_h = self.device_controller.get_gray_color_frame()
                 if gray is not None and frame_w == width and frame_h == height:
                     frames_gray.append(gray)
+                    frames_color.append(color)
                     z_list.append(z_est)
                 next_cap += itv
 
@@ -302,27 +369,31 @@ class TemporalDepthDialog(QDialog):
             time.sleep(max(0.0, next_cap - time.time()))
 
         self.device_controller._z_position = z_est if z_list else z1
+        try:
+            self.device_controller.send_gcode_wait("M400\n", timeout=max(2.0, sweep_s + 2.0))
+            self.device_controller.refresh_z_position(timeout=0.8)
+        except Exception:
+            self.device_controller._z_position = z1
         self._sig_log.emit(
-            "  {} 结束：采集 {} 帧，Z 估算范围 {:.3f}~{:.3f} mm".format(
+            "{}完成：{} 帧，Z {:.3f}~{:.3f}mm".format(
                 label,
                 len(frames_gray),
                 min(z_list) if z_list else z0,
                 max(z_list) if z_list else z1,
             )
         )
-        return frames_gray, z_list
+        return frames_gray, z_list, frames_color
 
     def _worker_fn(self, params):
         try:
-            self._sig_log.emit("═══ 开始 连续扫描重建 ═══")
             self._sig_log.emit(
-                "粗扫: Z {:.2f}->{:.2f}mm  速度 {:.2f}mm/s  采帧 {:.0f}ms".format(
+                "开始：Z {:.2f}->{:.2f}mm，速度 {:.2f}mm/s，采帧 {:.0f}ms".format(
                     params["z0"], params["z1"], params["speed"], params["itv"] * 1000
                 )
             )
 
             self._sig_status.emit("第一轮 粗扫...", "blue")
-            frames1, zlist1 = self._do_sweep(params["z0"], params["z1"], params["speed"], params["itv"], "粗扫")
+            frames1, zlist1, colors1 = self._do_sweep(params["z0"], params["z1"], params["speed"], params["itv"], "粗扫")
             if not self._running or frames1 is None or len(frames1) < 3:
                 self._sig_status.emit(
                     "粗扫{}".format("已停止" if not self._running else "帧不足，请检查相机"), "orange"
@@ -330,35 +401,39 @@ class TemporalDepthDialog(QDialog):
                 self._sig_done.emit(False, "")
                 return
 
-            depth_map, sharp_map, gray_map = build_best_focus_maps(frames1, zlist1)
+            depth_map, sharp_map, gray_map, color_map = build_best_focus_color_maps(frames1, zlist1, colors1)
             if depth_map is None:
                 self._sig_status.emit("锐度栈生成失败", "red")
                 self._sig_done.emit(False, "")
                 return
+            reference_frames = list(frames1)
+            reference_z_list = list(zlist1)
+            reference_colors = list(colors1)
 
             height, width = depth_map.shape
             self._img_size = (width, height)
             self._sig_progress.emit(52)
 
             if params["nested"] and self._running:
-                self._sig_log.emit("── 嵌套精扫开始 ──────────────────────────────")
                 fine_z0, fine_z1 = select_focus_window(zlist1, frames1, params["fine_pct"])
                 self._sig_log.emit(
-                    "  精扫区间: {:.3f} ~ {:.3f} mm  (Delta {:.3f} mm)".format(
-                        fine_z0, fine_z1, fine_z1 - fine_z0
-                    )
+                    "精扫区间：{:.3f}~{:.3f}mm".format(fine_z0, fine_z1)
                 )
-                frames2, zlist2 = self._do_sweep(
+                frames2, zlist2, colors2 = self._do_sweep(
                     fine_z0, fine_z1, params["fine_speed"], params["fine_itv"], "精扫"
                 )
                 if frames2 and len(frames2) >= 2 and self._running:
+                    reference_frames.extend(frames2)
+                    reference_z_list.extend(zlist2)
+                    reference_colors.extend(colors2)
                     depth_f, sharp_f, gray_f = build_best_focus_maps(frames2, zlist2)
                     updated = merge_focus_maps(depth_map, sharp_map, gray_map, depth_f, sharp_f, gray_f)
-                    self._sig_log.emit("个像素由精扫更新".format(updated))
+                    _, _, _, color_map = build_best_focus_color_maps(reference_frames, reference_z_list, reference_colors)
+                    self._sig_log.emit("精扫更新：{:,} 像素".format(updated))
                 else:
-                    self._sig_log.emit("  精扫帧不足或已停止，跳过融合")
+                    self._sig_log.emit("精扫帧不足，跳过")
             elif not params["nested"]:
-                self._sig_log.emit("（未启用嵌套精扫）")
+                self._sig_log.emit("未启用精扫")
 
             if not self._running:
                 self._sig_status.emit("已停止", "orange")
@@ -386,15 +461,48 @@ class TemporalDepthDialog(QDialog):
             self._pc = point_cloud
             self._depth_map = depth_map
             self._sharp_map = sharp_map
+            self._intensity_map = gray_map
+            reference_map, reference_z, reference_score = select_best_single_frame(reference_frames, reference_z_list)
+            reference_color_map = None
+            if reference_z is not None and reference_colors:
+                for idx, z_pos in enumerate(reference_z_list):
+                    if float(z_pos) == float(reference_z) and idx < len(reference_colors):
+                        reference_color_map = reference_colors[idx]
+                        break
+            if reference_map is not None:
+                self._sig_log.emit("最佳单帧：Z={:.3f}mm".format(float(reference_z)))
+
+            save_dir = self.config_manager.effective_save_path()
+            output_paths = save_output_bundle(
+                save_dir,
+                "temporal",
+                gray_map,
+                depth_map,
+                point_cloud,
+                self.config_manager.pixels_per_mm,
+                params={
+                    "z0": params["z0"],
+                    "z1": params["z1"],
+                    "speed": params["speed"],
+                    "itvms": int(params["itv"] * 1000),
+                    "zscale": params["z_scale"],
+                    "sharp": params["min_sharp"],
+                },
+                z_scale=params["z_scale"],
+                comment="Generated by BasicDemo TemporalDepth",
+                reference_map=reference_map,
+                reference_label="best Z={:.3f} mm".format(float(reference_z)) if reference_z is not None else "best single frame",
+                color_map=color_map,
+                reference_color_map=reference_color_map,
+            )
+            self._last_output_paths = output_paths
+
             self._sig_progress.emit(100)
-            summary = (
-                "扫描完成\n点数: {:,}   覆盖率: {:.1f}%\n"
-                "pixels/mm={:.2f}  图像 {}x{}".format(
-                    len(point_cloud), coverage, self.config_manager.pixels_per_mm, width, height
-                )
+            summary = "完成：{}x{}，点云 {:,} 点，覆盖率 {:.1f}%\n目录：{}".format(
+                width, height, len(point_cloud), coverage, save_dir
             )
             self._sig_status.emit(summary, "green")
-            self._sig_log.emit("═══ 完成：{:,} 点，覆盖率 {:.1f}% ═══".format(len(point_cloud), coverage))
+            self._sig_log.emit("保存：{}".format(save_dir))
             self._sig_done.emit(True, summary)
         except Exception as exc:
             self._sig_status.emit("发生异常: " + str(exc), "red")
@@ -404,8 +512,8 @@ class TemporalDepthDialog(QDialog):
             self._running = False
 
     def _visualize(self):
-        if self._pc is None or len(self._pc) == 0:
-            QMessageBox.warning(self, "提示", "暂无点云数据，请先执行扫描重建。")
+        if self._depth_map is None or self._pc is None or len(self._pc) == 0:
+            QMessageBox.warning(self, "提示", "暂无点云/深度图数据，请先执行扫描重建。")
             return
         try:
             import matplotlib
@@ -417,40 +525,62 @@ class TemporalDepthDialog(QDialog):
 
             fp = get_mpl_font()
             title_kw = {"fontproperties": fp} if fp else {}
-            fig = plt.figure(figsize=(16, 6))
-            fig.suptitle("连续扫描重建", fontsize=14, **title_kw)
+            fig = plt.figure(figsize=(14, 6))
+            fig.suptitle("连续扫描重建结果", fontsize=14, **title_kw)
 
-            ax1 = fig.add_subplot(1, 3, 1)
-            ppmm = self.config_manager.pixels_per_mm
+            ppmm = self.config_manager.pixels_per_mm if self.config_manager.pixels_per_mm > 0 else 1.0
             width, height = self._img_size
+            depth = np.asarray(self._depth_map, dtype=np.float32)
+            finite = depth[np.isfinite(depth)]
+            depth_show = depth - float(np.nanpercentile(finite, 2.0)) if finite.size else depth
+            d_valid = depth_show[np.isfinite(depth_show)]
+            d_min = float(np.nanpercentile(d_valid, 2.0))  if d_valid.size else 0.0
+            d_max = float(np.nanpercentile(d_valid, 98.0)) if d_valid.size else 1.0
+            ax1 = fig.add_subplot(1, 2, 1)
             image = ax1.imshow(
-                self._depth_map,
+                depth_show,
                 cmap="plasma",
                 origin="upper",
+                vmin=d_min, vmax=d_max,
                 extent=[-width / (2 * ppmm), width / (2 * ppmm), height / (2 * ppmm), -height / (2 * ppmm)],
             )
-            plt.colorbar(image, ax=ax1).set_label("Depth (mm)")
-            ax1.set_title("Depth Map", **title_kw)
+            cbar = plt.colorbar(image, ax=ax1)
+            cbar.set_label("相对深度 (mm)", fontproperties=fp if fp else None)
+            cbar.ax.text(0.5, 1.02, "黑紫=高(近)", transform=cbar.ax.transAxes,
+                         ha="center", va="bottom", fontsize=8, color="#333")
+            cbar.ax.text(0.5, -0.04, "黄=低(远)", transform=cbar.ax.transAxes,
+                         ha="center", va="top", fontsize=8, color="#333")
+            step = max(1, depth_show.shape[0] // 300)
+            ds = depth_show[::step, ::step]
+            xc = np.linspace(-width / (2 * ppmm), width / (2 * ppmm), ds.shape[1])
+            yc = np.linspace(-height / (2 * ppmm), height / (2 * ppmm), ds.shape[0])
+            levels = np.linspace(d_min, d_max, 8)[1:-1]
+            try:
+                cs = ax1.contour(xc, yc, ds, levels=levels, colors="white", linewidths=0.6, alpha=0.75)
+                ax1.clabel(cs, fmt="%.2f mm", fontsize=7, inline=True, inline_spacing=4)
+            except Exception:
+                pass
+            ax1.set_title("深度图  (黑紫=高面 / 黄=低面)", **title_kw)
             ax1.set_xlabel("X (mm)")
             ax1.set_ylabel("Y (mm)")
 
-            ax2 = fig.add_subplot(1, 3, 2)
-            image2 = ax2.imshow(np.log1p(self._sharp_map), cmap="hot", origin="upper")
-            plt.colorbar(image2, ax=ax2).set_label("log(1+sharpness)")
-            ax2.set_title("Sharpness Map (log)", **title_kw)
-
-            ax3 = fig.add_subplot(1, 3, 3, projection="3d")
-            x, y, z, intensity = self._pc[:, 0], self._pc[:, 1], self._pc[:, 2], self._pc[:, 3]
-            max_pts = 60000
+            pc = self._pc
+            x, y, z, intensity = pc[:, 0], pc[:, 1], pc[:, 2], pc[:, 3]
+            max_pts = 80000
             if len(x) > max_pts:
-                index = np.random.choice(len(x), max_pts, replace=False)
+                index = np.random.default_rng(42).choice(len(x), max_pts, replace=False)
                 x, y, z, intensity = x[index], y[index], z[index], intensity[index]
-            scatter = ax3.scatter(x, y, z, c=intensity, cmap="gray", s=0.5, alpha=0.6)
-            plt.colorbar(scatter, ax=ax3, label="Intensity")
-            ax3.set_xlabel("X (mm)")
-            ax3.set_ylabel("Y (mm)")
-            ax3.set_zlabel("Z (mm)")
-            ax3.set_title("Point Cloud ({:,} pts)".format(len(self._pc)), **title_kw)
+            ax2 = fig.add_subplot(1, 2, 2, projection="3d")
+            scatter = ax2.scatter(x, y, z, c=z, cmap="turbo", s=0.35, alpha=0.70, linewidths=0)
+            plt.colorbar(scatter, ax=ax2, label="Relative height (mm)")
+            ax2.set_xlabel("X (mm)")
+            ax2.set_ylabel("Y (mm)")
+            ax2.set_zlabel("Z (mm)")
+            ax2.set_title("Point Cloud ({:,} pts)".format(len(self._pc)), **title_kw)
+            try:
+                ax2.set_box_aspect((max(float(np.ptp(x)), 1e-6), max(float(np.ptp(y)), 1e-6), max(float(np.ptp(z)), 1e-6)))
+            except Exception:
+                pass
             plt.tight_layout()
             plt.show()
         except ImportError:
@@ -467,7 +597,7 @@ class TemporalDepthDialog(QDialog):
             self,
             "导出点云",
             os.path.join(self.config_manager.effective_save_path(), default_name),
-            "PLY 文件 (*.ply);;CSV 文件 (*.csv);;全部文件 (*.*)",
+            "PLY 文件 (*.ply);;OBJ 文件 (*.obj);;CSV 文件 (*.csv);;全部文件 (*.*)",
         )
         if not file_path:
             return
@@ -483,3 +613,4 @@ class TemporalDepthDialog(QDialog):
             )
         except Exception as exc:
             QMessageBox.warning(self, "导出错误", str(exc))
+

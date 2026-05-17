@@ -9,16 +9,16 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 _COMPACT_MARGINS  = (8, 14, 8, 8)
 _COMPACT_SPACING  = 4
-_COL_MAX_W        = 280
-_COL_MIN_W        = 240
+_COL_MAX_W        = 320
+_COL_MIN_W        = 260
 
 
 class Ui_MainWindow(object):
 
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
-        MainWindow.resize(1200, 700)
-        MainWindow.setMinimumSize(960, 580)
+        MainWindow.resize(1400, 760)
+        MainWindow.setMinimumSize(1060, 620)
 
         self.centralWidget = QtWidgets.QWidget(MainWindow)
         self.centralWidget.setObjectName("centralWidget")
@@ -42,6 +42,10 @@ class Ui_MainWindow(object):
             QtWidgets.QSizePolicy.Expanding)
         self.widgetDisplay.setMinimumSize(320, 200)
         self.widgetDisplay.setStyleSheet("background: #111;")
+        self.widgetDisplay.setAttribute(QtCore.Qt.WA_NativeWindow, True)
+        self.widgetDisplay.setAttribute(QtCore.Qt.WA_PaintOnScreen, True)
+        self.widgetDisplay.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
+        self.widgetDisplay.setAutoFillBackground(False)
         leftV.addWidget(self.widgetDisplay, stretch=1)
 
         mainH.addLayout(leftV, stretch=1)
@@ -56,7 +60,8 @@ class Ui_MainWindow(object):
         col1V.addWidget(self._make_init_group())
         col1V.addWidget(self._make_grab_group())
         col1V.addWidget(self._make_param_group())
-        col1V.addWidget(self._make_capture_group())
+        col1V.addWidget(self._make_scale_group())
+        col1V.addWidget(self._make_dark_group())
         col1V.addStretch(1)
         col1W = QtWidgets.QWidget()
         col1W.setLayout(col1V)
@@ -67,10 +72,7 @@ class Ui_MainWindow(object):
         col2V = QtWidgets.QVBoxLayout()
         col2V.setSpacing(5)
         col2V.addWidget(self._make_serial_group())
-        col2V.addWidget(self._make_motion_group())
-        col2V.addWidget(self._make_scale_group())
-        col2V.addWidget(self._make_dark_group())
-        col2V.addStretch(1)
+        col2V.addWidget(self._make_motion_group(), stretch=1)
         col2W = QtWidgets.QWidget()
         col2W.setLayout(col2V)
         col2W.setMinimumWidth(_COL_MIN_W)
@@ -181,36 +183,6 @@ class Ui_MainWindow(object):
         self.groupParam = grp
         return grp
 
-    def _make_capture_group(self):
-        grp = QtWidgets.QGroupBox()
-        grp.setObjectName("groupAutoCapture")
-        g = QtWidgets.QGridLayout(grp)
-        g.setContentsMargins(*_COMPACT_MARGINS)
-        g.setSpacing(_COMPACT_SPACING)
-
-        self.label_capture = QtWidgets.QLabel(); self.label_capture.setObjectName("label_capture")
-        self.edtCaptureCount = QtWidgets.QLineEdit(); self.edtCaptureCount.setObjectName("edtCaptureCount")
-        g.addWidget(self.label_capture, 0, 0); g.addWidget(self.edtCaptureCount, 0, 1)
-
-        self.bnAutoCapture = QtWidgets.QPushButton()
-        self.bnAutoCapture.setEnabled(False)
-        self.bnAutoCapture.setObjectName("bnAutoCapture")
-        g.addWidget(self.bnAutoCapture, 1, 0, 1, 2)
-
-        self.bnSetSavePath = QtWidgets.QPushButton()
-        self.bnSetSavePath.setObjectName("bnSetSavePath")
-        g.addWidget(self.bnSetSavePath, 2, 0, 1, 2)
-
-        self.lblSavePathInfo = QtWidgets.QLineEdit()
-        self.lblSavePathInfo.setObjectName("lblSavePathInfo")
-        self.lblSavePathInfo.setReadOnly(True)
-        self.lblSavePathInfo.setStyleSheet("font-size: 10px; color: #555;")
-        g.addWidget(self.lblSavePathInfo, 3, 0, 1, 2)
-
-        g.setColumnStretch(0, 2); g.setColumnStretch(1, 3)
-        self.groupAutoCapture = grp
-        return grp
-
     def _make_serial_group(self):
         grp = QtWidgets.QGroupBox()
         grp.setObjectName("groupSerial")
@@ -272,6 +244,32 @@ class Ui_MainWindow(object):
         g.addWidget(self.bnMoveStep, 4, 0, 1, 2)
         g.addWidget(self.bnMoveStepDown, 4, 2, 1, 1)
 
+        self.lblZPos = QtWidgets.QLabel("Z: -- mm")
+        self.lblZPos.setObjectName("lblZPos")
+        self.lblZPos.setAlignment(QtCore.Qt.AlignCenter)
+        self.lblZPos.setStyleSheet(
+            "font-size: 16px; font-weight: bold; color: #0078d7;"
+            "background: #ffffff; border: 1px solid #0078d7; border-radius: 4px; padding: 3px;"
+        )
+        g.addWidget(self.lblZPos, 5, 0, 1, 3)
+
+        self.lblZMinLimit = QtWidgets.QLabel("最低提醒: -- mm")
+        self.lblZMinLimit.setObjectName("lblZMinLimit")
+        self.lblZMinLimit.setAlignment(QtCore.Qt.AlignCenter)
+        self.lblZMinLimit.setStyleSheet(
+            "font-size: 12px; font-weight: bold; color: #444;"
+            "background: #ffffff; border: 1px solid #cccccc; border-radius: 4px; padding: 3px;"
+        )
+        self.lblZMaxLimit = QtWidgets.QLabel("最高提醒: -- mm")
+        self.lblZMaxLimit.setObjectName("lblZMaxLimit")
+        self.lblZMaxLimit.setAlignment(QtCore.Qt.AlignCenter)
+        self.lblZMaxLimit.setStyleSheet(
+            "font-size: 12px; font-weight: bold; color: #444;"
+            "background: #ffffff; border: 1px solid #cccccc; border-radius: 4px; padding: 3px;"
+        )
+        g.addWidget(self.lblZMinLimit, 6, 0, 1, 1)
+        g.addWidget(self.lblZMaxLimit, 6, 1, 1, 2)
+
         self.label_light = QtWidgets.QLabel(); self.label_light.setObjectName("label_light")
         self.sliderLight = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.sliderLight.setObjectName("sliderLight")
@@ -281,9 +279,10 @@ class Ui_MainWindow(object):
         self.lblLightValue.setObjectName("lblLightValue")
         self.lblLightValue.setMinimumWidth(28)
         self.lblLightValue.setAlignment(QtCore.Qt.AlignCenter)
-        g.addWidget(self.label_light, 5, 0); g.addWidget(self.sliderLight, 5, 1); g.addWidget(self.lblLightValue, 5, 2)
+        g.addWidget(self.label_light, 7, 0); g.addWidget(self.sliderLight, 7, 1); g.addWidget(self.lblLightValue, 7, 2)
 
         g.setColumnStretch(0, 2); g.setColumnStretch(1, 3); g.setColumnStretch(2, 2)
+        grp.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
         self.groupMotion = grp
         return grp
 
@@ -303,37 +302,24 @@ class Ui_MainWindow(object):
         g.addWidget(self.label_ppmm,     0, 1)
         g.addWidget(self.edtPixelsPerMm, 0, 2)
 
-        self.bnSetScaleCalib = QtWidgets.QPushButton()
-        self.bnSetScaleCalib.setObjectName("bnSetScaleCalib")
-        g.addWidget(self.bnSetScaleCalib, 1, 0)
+        self.label_dot_spacing = QtWidgets.QLabel(); self.label_dot_spacing.setObjectName("label_dot_spacing")
+        self.edtDotSpacing = QtWidgets.QLineEdit(); self.edtDotSpacing.setObjectName("edtDotSpacing")
+        self.edtDotSpacing.setText("200")
+        self.edtDotSpacing.setMaximumWidth(70)
+        g.addWidget(self.label_dot_spacing, 1, 0, 1, 2)
+        g.addWidget(self.edtDotSpacing,     1, 2)
 
-        self.lblScaleBarInfo = QtWidgets.QLabel()
-        self.lblScaleBarInfo.setObjectName("lblScaleBarInfo")
-        self.lblScaleBarInfo.setAlignment(QtCore.Qt.AlignCenter)
-        self.lblScaleBarInfo.setStyleSheet("font-size: 10px; color: #444;")
-        g.addWidget(self.lblScaleBarInfo, 1, 1, 1, 2)
+        self.bnQuickScale = QtWidgets.QPushButton()
+        self.bnQuickScale.setEnabled(False)
+        self.bnQuickScale.setObjectName("bnQuickScale")
+        g.addWidget(self.bnQuickScale, 2, 0, 1, 1)
 
-        self.lblAutoCalibSep = QtWidgets.QLabel()
-        self.lblAutoCalibSep.setObjectName("lblAutoCalibSep")
-        self.lblAutoCalibSep.setAlignment(QtCore.Qt.AlignCenter)
-        self.lblAutoCalibSep.setStyleSheet("color: gray; font-size: 10px;")
-        g.addWidget(self.lblAutoCalibSep, 2, 0, 1, 3)
-
-        self.label_calib_move = QtWidgets.QLabel(); self.label_calib_move.setObjectName("label_calib_move")
-        self.edtCalibMoveMm = QtWidgets.QLineEdit(); self.edtCalibMoveMm.setObjectName("edtCalibMoveMm")
-        g.addWidget(self.label_calib_move, 3, 0); g.addWidget(self.edtCalibMoveMm, 3, 1, 1, 2)
-
-        self.bnAutoCalib = QtWidgets.QPushButton()
-        self.bnAutoCalib.setEnabled(False)
-        self.bnAutoCalib.setObjectName("bnAutoCalib")
-        g.addWidget(self.bnAutoCalib, 4, 0)
-
-        self.lblAutoCalibStatus = QtWidgets.QLabel()
-        self.lblAutoCalibStatus.setObjectName("lblAutoCalibStatus")
-        self.lblAutoCalibStatus.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        self.lblAutoCalibStatus.setWordWrap(True)
-        self.lblAutoCalibStatus.setStyleSheet("font-size: 10px; color: #444;")
-        g.addWidget(self.lblAutoCalibStatus, 4, 1, 1, 2)
+        self.lblQuickScaleStatus = QtWidgets.QLabel()
+        self.lblQuickScaleStatus.setObjectName("lblQuickScaleStatus")
+        self.lblQuickScaleStatus.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.lblQuickScaleStatus.setWordWrap(True)
+        self.lblQuickScaleStatus.setStyleSheet("font-size: 10px; color: #444;")
+        g.addWidget(self.lblQuickScaleStatus, 2, 1, 1, 2)
 
         g.setColumnStretch(0, 3); g.setColumnStretch(1, 2); g.setColumnStretch(2, 3)
         self.groupScaleBar = grp
@@ -388,19 +374,13 @@ class Ui_MainWindow(object):
         self.lblAutoFocusStatus.setText(    _("MainWindow", "就绪"))
         self.groupParam.setTitle(           _("MainWindow", "参数"))
         self.label_4.setText(               _("MainWindow", "曝光"))
-        self.edtExposureTime.setText(       _("MainWindow", "0"))
+        self.edtExposureTime.setText(       _("MainWindow", "80000"))
         self.label_5.setText(               _("MainWindow", "增益"))
-        self.edtGain.setText(               _("MainWindow", "0"))
+        self.edtGain.setText(               _("MainWindow", "5"))
         self.label_6.setText(               _("MainWindow", "帧率"))
         self.edtFrameRate.setText(          _("MainWindow", "0"))
         self.bnGetParam.setText(            _("MainWindow", "获取参数"))
         self.bnSetParam.setText(            _("MainWindow", "设置参数"))
-        self.groupAutoCapture.setTitle(     _("MainWindow", "自动拍摄"))
-        self.label_capture.setText(         _("MainWindow", "张数"))
-        self.edtCaptureCount.setText(       _("MainWindow", "1"))
-        self.bnAutoCapture.setText(         _("MainWindow", "开始自动拍摄"))
-        self.bnSetSavePath.setText(         _("MainWindow", "设置保存路径"))
-        self.lblSavePathInfo.setText(       _("MainWindow", "保存至: (默认)"))
         self.groupSerial.setTitle(          _("MainWindow", "串口设置"))
         self.label_serial_port.setText(     _("MainWindow", "串口名称"))
         self.bnRefreshPort.setText(         _("MainWindow", "刷新串口"))
@@ -424,13 +404,9 @@ class Ui_MainWindow(object):
         self.chkShowScaleBar.setText(       _("MainWindow", "显示比例尺"))
         self.label_ppmm.setText(            _("MainWindow", "像素/mm"))
         self.edtPixelsPerMm.setText(        _("MainWindow", "100.0"))
-        self.bnSetScaleCalib.setText(       _("MainWindow", "应用标定值"))
-        self.lblScaleBarInfo.setText(       _("MainWindow", ""))
-        self.lblAutoCalibSep.setText(       _("MainWindow", " 自动标定 "))
-        self.label_calib_move.setText(      _("MainWindow", "移动距离(mm)"))
-        self.edtCalibMoveMm.setText(        _("MainWindow", "1.0"))
-        self.bnAutoCalib.setText(           _("MainWindow", "自动标定"))
-        self.lblAutoCalibStatus.setText(    _("MainWindow", "就绪"))
+        self.label_dot_spacing.setText(      _("MainWindow", "点距(µm)"))
+        self.bnQuickScale.setText(          _("MainWindow", "快速比例尺"))
+        self.lblQuickScaleStatus.setText(   _("MainWindow", "就绪"))
         self.groupDarkSub.setTitle(         _("MainWindow", "底噪扣除"))
         self.bnCaptureDark.setText(         _("MainWindow", "采集底噪帧"))
         self.chkDarkSub.setText(            _("MainWindow", "启用底噪扣除"))

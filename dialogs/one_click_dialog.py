@@ -1,24 +1,11 @@
-"""一键出图对话框
-
-拍摄方向（固定）：Z 轴从高位 → 低位，即从上向下。
-
-流程
-----
-1. 检查相机、串口、参数合法性
-2. 移动 Z 轴到高位（扫描起点）
-3. 从高位逐步向低位运动，每步拍一帧灰度图
-4. 用 DFF（逐像素焦点融合）生成合成图
-5. 自动保存合成图到指定目录（BMP）
-6. 在对话框内预览结果图
-7. 输出完整日志
-"""
+"""一键扫描、融合并保存出图结果。"""
 import os
 import threading
 import time
 from datetime import datetime
 
 import numpy as np
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QCheckBox,
@@ -37,7 +24,18 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
-from algorithms import compute_dff_volume, ensure_dir, save_composite_image, point_cloud_from_depth, export_point_cloud, get_mpl_font
+from algorithms import (
+    build_best_focus_maps,
+    build_best_focus_color_maps,
+    export_point_cloud,
+    get_mpl_font,
+    merge_focus_maps,
+    point_cloud_from_depth,
+    save_composite_image,
+    save_output_bundle,
+    select_best_single_frame,
+    select_focus_window,
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -77,6 +75,7 @@ class OneClickDialog(QDialog):
         self._point_cloud = None     # 点云数据（Nx4 数组）
         self._img_size = (0, 0)      # 图像尺寸 (width, height)
         self._last_save_path = ""
+        self._last_output_paths = {}
         # 持有 QImage 的底层数组引用，防止 GC
         self._preview_arr_ref = None
 
@@ -85,11 +84,52 @@ class OneClickDialog(QDialog):
         self._sig_progress.connect(self.progressBar.setValue)
         self._sig_log.connect(self._append_log)
         self._sig_done.connect(self._on_done)
+        self._z_timer = QTimer(self)
+        self._z_timer.timeout.connect(self._refresh_z_label)
+        self._z_timer.start(200)
 
-    # ── UI 构建 ────────────────────────────────────────────────
+    def _refresh_z_label(self):
+        z = self.device_controller._z_position
+        min_limit = getattr(self.device_controller, "_z_min_limit", 0.0)
+        max_limit = getattr(self.device_controller, "_z_soft_limit", 68.0)
+        self.lblZPos.setText(
+            "Z 当前位置: {:.3f} mm    最低提醒: {:.1f} mm    最高提醒: {:.1f} mm".format(
+                z, min_limit, max_limit
+            )
+        )
+        color = (
+            "#ff3333" if z <= min_limit or z >= max_limit
+            else "#ffb000" if z <= min_limit + 1.0 or z >= max_limit - 5.0
+            else "#00aaff"
+        )
+        self.lblZPos.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: {};"
+            "background: #ffffff; border: 1px solid {}; border-radius: 4px; padding: 4px;".format(color, color)
+        )
+
+    def sync_z_inputs_to_current(self):
+        z = float(self.device_controller._z_position)
+        try:
+            span = abs(float(self.edtZHigh.text().strip()) - float(self.edtZLow.text().strip()))
+        except ValueError:
+            span = 4.0
+        span = max(0.1, span)
+        self.edtZHigh.setText("{:.3f}".format(z + span))
+        self.edtZLow.setText("{:.3f}".format(z))
+        self._refresh_z_label()
+
+    # ── UI 构建 ────────────────────────────────────────────
     def _setup_ui(self):
         root = QVBoxLayout(self)
         root.setSpacing(6)
+
+        self.lblZPos = QLabel("Z 当前位置: -- mm")
+        self.lblZPos.setAlignment(Qt.AlignCenter)
+        self.lblZPos.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #0078d7;"
+            "background: #ffffff; border: 1px solid #0078d7; border-radius: 4px; padding: 4px;"
+        )
+        root.addWidget(self.lblZPos)
 
         # ── 参数组 ──
         grp_params = QGroupBox("扫描参数（Z 轴：从上向下）")
@@ -109,13 +149,13 @@ class OneClickDialog(QDialog):
         root.addWidget(grp_params)
 
         # ── 方向说明标签 ──
-        lbl_dir = QLabel("拍摄方向：Z 轴 高位 → 低位（从上向下），步长始终为负方向")
+        lbl_dir = QLabel("拍摄方向：Z 高位 → 低位")
         lbl_dir.setStyleSheet("color: #1a6a0a; font-size: 11px; padding: 2px 4px;")
         lbl_dir.setWordWrap(True)
         root.addWidget(lbl_dir)
 
         # ── 融合方式说明 ──
-        lbl_fuse = QLabel("融合方式：DFF 焦点融合——逐像素保留最清晰帧的灰度值，输出全焦合成图")
+        lbl_fuse = QLabel("融合方式：DFF 焦点融合")
         lbl_fuse.setStyleSheet("color: #555; font-size: 11px; padding: 2px 4px;")
         lbl_fuse.setWordWrap(True)
         root.addWidget(lbl_fuse)
@@ -126,8 +166,8 @@ class OneClickDialog(QDialog):
         adv_layout.setSpacing(4)
 
         # 复选框：是否生成点云
-        self.chkPointCloud = QCheckBox("同时生成点云数据（用于 3D 测量和导出）")
-        self.chkPointCloud.setChecked(False)
+        self.chkPointCloud = QCheckBox("自动输出三维点云（PLY/OBJ）")
+        self.chkPointCloud.setChecked(True)
         self.chkPointCloud.stateChanged.connect(self._on_pointcloud_toggle)
         adv_layout.addWidget(self.chkPointCloud)
 
@@ -138,14 +178,35 @@ class OneClickDialog(QDialog):
         form_pc.setLabelAlignment(Qt.AlignRight)
         form_pc.setContentsMargins(20, 0, 0, 0)
         self.edtZScale = QLineEdit("1.0")
-        self.edtMinSharpness = QLineEdit("20.0")
+        self.edtMinSharpness = QLineEdit("5.0")
         self.edtZScale.setMaximumWidth(80)
         self.edtMinSharpness.setMaximumWidth(80)
         form_pc.addRow("Z 轴缩放系数:", self.edtZScale)
-        form_pc.addRow("最小锐度阈值:", self.edtMinSharpness)
+        form_pc.addRow("最小锐度(%, 0-100):", self.edtMinSharpness)
         self.grpPcParams.setLayout(form_pc)
         self.grpPcParams.setVisible(False)
         adv_layout.addWidget(self.grpPcParams)
+
+        # 复选框：是否启用粗扫+细扫
+        self.chkCoarseFine = QCheckBox("启用粗扫+细扫")
+        self.chkCoarseFine.setChecked(False)
+        self.chkCoarseFine.stateChanged.connect(self._on_coarsefine_toggle)
+        adv_layout.addWidget(self.chkCoarseFine)
+
+        self.grpCfParams = QGroupBox()
+        self.grpCfParams.setStyleSheet("QGroupBox { border: none; margin: 0; padding: 0; }")
+        form_cf = QFormLayout()
+        form_cf.setLabelAlignment(Qt.AlignRight)
+        form_cf.setContentsMargins(20, 0, 0, 0)
+        self.edtCoarseFactor = QLineEdit("3")
+        self.edtFinePct = QLineEdit("30")
+        self.edtCoarseFactor.setMaximumWidth(80)
+        self.edtFinePct.setMaximumWidth(80)
+        form_cf.addRow("粗扫步长倍数:", self.edtCoarseFactor)
+        form_cf.addRow("精扫区间比例 %:", self.edtFinePct)
+        self.grpCfParams.setLayout(form_cf)
+        self.grpCfParams.setVisible(False)
+        adv_layout.addWidget(self.grpCfParams)
 
         grp_advanced.setLayout(adv_layout)
         root.addWidget(grp_advanced)
@@ -178,7 +239,18 @@ class OneClickDialog(QDialog):
         preview_layout.addWidget(self.lblPreview)
         grp_preview.setLayout(preview_layout)
         root.addWidget(grp_preview, stretch=1)
-
+        # ── 保存路径 ──
+        save_row = QHBoxLayout()
+        save_row.addWidget(QLabel("保存路径:"))
+        self._edt_save_path = QLineEdit(self.config_manager.effective_save_path())
+        self._edt_save_path.setReadOnly(True)
+        self._edt_save_path.setStyleSheet("font-size: 10px; color: #555;")
+        self._btn_browse_save = QPushButton("浏览...")
+        self._btn_browse_save.setMaximumWidth(60)
+        self._btn_browse_save.clicked.connect(self._browse_save_path)
+        save_row.addWidget(self._edt_save_path, stretch=1)
+        save_row.addWidget(self._btn_browse_save)
+        root.addLayout(save_row)
         # ── 按钮行 1：开始/停止 ──
         row1 = QHBoxLayout()
         self.bnStart = QPushButton("一键出图")
@@ -216,18 +288,28 @@ class OneClickDialog(QDialog):
         self.bnExport.clicked.connect(self._export)
         self.bnVisualize.clicked.connect(self._visualize_point_cloud)
         self.bnExportPly.clicked.connect(self._export_point_cloud)
+        self._on_pointcloud_toggle(Qt.Checked if self.chkPointCloud.isChecked() else Qt.Unchecked)
 
     # ── 信号槽 ─────────────────────────────────────────────────
+    def _browse_save_path(self):
+        path = QFileDialog.getExistingDirectory(self, "选择保存路径", self.config_manager.effective_save_path())
+        if path:
+            self.config_manager.save_path = path
+            self._edt_save_path.setText(path)
+
     def _on_pointcloud_toggle(self, state):
         """复选框切换：显示/隐藏点云参数和按钮"""
         checked = state == Qt.Checked
         self.grpPcParams.setVisible(checked)
         self.bnVisualize.setVisible(checked)
         self.bnExportPly.setVisible(checked)
-        # 如果取消勾选，禁用按钮
+        # 如果取消勾选，禁用按鈕
         if not checked:
             self.bnVisualize.setEnabled(False)
             self.bnExportPly.setEnabled(False)
+
+    def _on_coarsefine_toggle(self, state):
+        self.grpCfParams.setVisible(state == Qt.Checked)
 
     def _on_status(self, message, color):
         self.lblStatus.setText(message)
@@ -250,7 +332,6 @@ class OneClickDialog(QDialog):
             if self._point_cloud is not None and len(self._point_cloud) > 0:
                 self.bnVisualize.setEnabled(True)
                 self.bnExportPly.setEnabled(True)
-
     # ── 参数解析 ───────────────────────────────────────────────
     def _parse_params(self):
         z_high = float(self.edtZHigh.text().strip())
@@ -311,15 +392,31 @@ class OneClickDialog(QDialog):
         else:
             params["gen_pointcloud"] = False
 
+        # 读取粗扫+细扫参数
+        coarse_fine = self.chkCoarseFine.isChecked()
+        params["coarse_fine"] = coarse_fine
+        if coarse_fine:
+            try:
+                params["coarse_factor"] = max(2, int(self.edtCoarseFactor.text().strip()))
+            except ValueError:
+                params["coarse_factor"] = 3
+            try:
+                params["fine_pct"] = max(10, min(80, float(self.edtFinePct.text().strip())))
+            except ValueError:
+                params["fine_pct"] = 30
+
         confirm_msg = (
             "拍摄方向：从上向下\n"
             "Z 轴：{:.3f} mm（高位）→ {:.3f} mm（低位）\n"
             "步长：{:.3f} mm，共 {} 步，每步延时 {:.2f}s\n"
-            "融合方式：DFF 焦点融合\n"
+            "融合方式：DFF 焦点融合（亚步长插值）\n"
         ).format(
             params["z_high"], params["z_low"],
             params["z_step"], params["n_steps"], params["delay"]
         )
+        if coarse_fine:
+            confirm_msg += "粗扫+细扫：是（粗步×{}，精扫区间={}%）\n".format(
+                params["coarse_factor"], int(params["fine_pct"]))
         if gen_pointcloud:
             confirm_msg += "点云生成：是（Z缩放={:.2f}，锐度阈值={:.1f}）\n".format(z_scale, min_sharp)
         confirm_msg += "\n确认开始？"
@@ -338,6 +435,7 @@ class OneClickDialog(QDialog):
         self._point_cloud = None
         self._img_size = (0, 0)
         self._last_save_path = ""
+        self._last_output_paths = {}
         self.bnStart.setEnabled(False)
         self.bnStop.setEnabled(True)
         self.bnExport.setEnabled(False)
@@ -378,30 +476,20 @@ class OneClickDialog(QDialog):
             self._sig_progress.emit(v)
 
         try:
-            emit_log("═══ 一键出图 开始 ═══")
-            emit_log("拍摄方向：从上向下（Z 高位→低位）")
-            emit_log("Z 高位={:.3f}mm  Z 低位={:.3f}mm  步长={:.3f}mm  步数={}".format(
+            emit_log("开始：Z {:.3f}->{:.3f}mm，步长 {:.3f}mm，{} 步".format(
                 z_high, z_low, z_step, n_steps))
 
             # ── 步骤 1：移动到高位起点 ──
             emit_status("步骤 1/4：移动到高位起点 Z={:.3f}mm...".format(z_high))
             try:
-                self.device_controller.move_z_absolute(z_high, feed=300)
-                emit_log("  move_z_absolute({:.4f}, F300) 已发送".format(z_high))
+                self.device_controller.move_z_absolute_wait(z_high, feed=300)
             except Exception as exc:
                 emit_status("串口发送失败: " + str(exc), "red")
                 self._sig_done.emit(False, None)
                 return
 
             # 等待运动台到达起点
-            wait_s = max(0.8, abs(z_high) / 5.0 + 0.5)
-            t0 = time.time()
-            while time.time() - t0 < wait_s:
-                if not self._running:
-                    emit_status("已停止", "orange")
-                    self._sig_done.emit(False, None)
-                    return
-                time.sleep(0.05)
+            time.sleep(0.1)
 
             # ── 步骤 2：检查相机图像尺寸 ──
             emit_status("步骤 2/4：获取图像尺寸...")
@@ -410,64 +498,140 @@ class OneClickDialog(QDialog):
                 emit_status("错误：无法获取相机帧，请检查相机是否正在输出图像", "red")
                 self._sig_done.emit(False, None)
                 return
-            emit_log("  图像尺寸 {}×{}".format(width, height))
+            emit_log("尺寸：{}×{}".format(width, height))
 
-            # ── 步骤 3：逐步从上向下扫描 ──
-            emit_status("步骤 3/4：从上向下扫描采帧…")
-            frames_gray = []
-            z_positions = []
+            # ── 内部扫描函数 ──
+            def do_scan(z_start, z_end, step, label, prog_base, prog_span):
+                n = max(1, int(round((z_start - z_end) / step)) + 1)
+                frames = []
+                color_frames = []
+                zpos = []
+                for i in range(n):
+                    if not self._running:
+                        return None, None, None
+                    z_cur = round(z_start - i * step, 6)
+                    zpos.append(z_cur)
+                    if i > 0:
+                        try:
+                            self.device_controller.move_z_relative_wait(-step, feed=300)
+                        except Exception as exc:
+                            emit_status("串口错误: " + str(exc), "red")
+                            return None, None, None
+                        time.sleep(delay)
+                    emit_status("{} Z={:.3f}mm ({}/{})".format(label, z_cur, i + 1, n))
+                    gray, color, fw, fh = self.device_controller.get_gray_color_frame()
+                    if gray is not None and fw == width and fh == height:
+                        frames.append(gray.astype(np.float32))
+                        color_frames.append(color)
+                    else:
+                        frames.append(np.zeros((height, width), dtype=np.float32))
+                        color_frames.append(None)
+                        emit_log("  [警告] Z={:.3f}mm 帧尺寸异常".format(z_cur))
+                    emit_progress(int(prog_base + (i + 1) / n * prog_span))
+                return frames, zpos, color_frames
 
-            for idx in range(n_steps):
+            coarse_fine = params.get("coarse_fine", False)
+
+            if coarse_fine:
+                coarse_factor = params.get("coarse_factor", 3)
+                fine_pct = params.get("fine_pct", 30)
+                coarse_step = z_step * coarse_factor
+
+                # ── 粗扫 ──
+                emit_log("粗扫：步长 {:.3f}mm".format(coarse_step))
+                coarse_frames, coarse_z, coarse_colors = do_scan(
+                    z_high, z_low, coarse_step, "粗扫", 0, 30)
+                if coarse_frames is None:
+                    emit_status("已停止", "orange")
+                    self._sig_done.emit(False, None)
+                    return
+                emit_log("粗扫完成：{} 帧".format(len(coarse_frames)))
+
+                emit_status("粗扫焦点融合 + 定位焦点区间…")
+                c_depth, c_sharp, c_intensity = build_best_focus_maps(
+                    coarse_frames, coarse_z)
+                if c_intensity is None:
+                    emit_status("错误：粗扫融合失败", "red")
+                    self._sig_done.emit(False, None)
+                    return
+
+                fine_z0, fine_z1 = select_focus_window(
+                    coarse_z, coarse_frames, fine_pct)
+                emit_log("精扫区间：{:.3f}~{:.3f}mm".format(fine_z0, fine_z1))
+                emit_progress(35)
+
+                # 移动到精扫起点（高位）
+                try:
+                    self.device_controller.move_z_absolute_wait(fine_z1, feed=300)
+                except Exception as exc:
+                    emit_status("串口错误: " + str(exc), "red")
+                    self._sig_done.emit(False, None)
+                    return
+                time.sleep(0.1)
+
+                # ── 精扫 ──
+                emit_log("精扫：步长 {:.3f}mm".format(z_step))
+                fine_frames, fine_z, fine_colors = do_scan(
+                    fine_z1, fine_z0, z_step, "精扫", 35, 35)
+                if fine_frames is None:
+                    emit_status("已停止", "orange")
+                    self._sig_done.emit(False, None)
+                    return
+                emit_log("精扫完成：{} 帧".format(len(fine_frames)))
+
+                emit_status("焦点融合中…")
+                f_depth, f_sharp, f_intensity = build_best_focus_maps(
+                    fine_frames, fine_z)
+                if f_intensity is not None:
+                    updated = merge_focus_maps(
+                        c_depth, c_sharp, c_intensity,
+                        f_depth, f_sharp, f_intensity)
+                    emit_log("精扫更新：{:,} 像素".format(updated))
+
+                depth_map = c_depth
+                sharp_map = c_sharp
+                intensity_map = c_intensity
+                frames_gray = coarse_frames + (fine_frames or [])
+                z_positions = coarse_z + (fine_z or [])
+                frames_color = coarse_colors + (fine_colors or [])
+                _, _, _, color_map = build_best_focus_color_maps(frames_gray, z_positions, frames_color)
+
+            else:
+                # ── 单次扫描（原始模式） ──
+                emit_status("步骤 3/4：从上向下扫描采帧…")
+                frames_gray, z_positions, frames_color = do_scan(
+                    z_high, z_low, z_step, "扫描", 0, 70)
+                if frames_gray is None:
+                    emit_status("已停止", "orange")
+                    self._sig_done.emit(False, None)
+                    return
                 if not self._running:
                     emit_status("已停止", "orange")
                     self._sig_done.emit(False, None)
                     return
 
-                # 当前 Z 位置（从高到低，step 取负）
-                z_cur = round(z_high - idx * z_step, 6)
-                z_positions.append(z_cur)
+                emit_log("采帧完成：{} 帧".format(len(frames_gray)))
 
-                if idx > 0:
-                    # 往低位移动一步
-                    try:
-                        self.device_controller.move_z_relative(-z_step, feed=300)
-                    except Exception as exc:
-                        emit_status("串口错误: " + str(exc), "red")
-                        self._sig_done.emit(False, None)
-                        return
-                    time.sleep(delay)
+                emit_status("步骤 4/4：焦点融合中…")
+                emit_progress(75)
+                depth_map, sharp_map, intensity_map, color_map = build_best_focus_color_maps(
+                    frames_gray, z_positions, frames_color)
 
-                emit_status("扫描 Z={:.3f}mm  ({}/{})".format(z_cur, idx + 1, n_steps))
-                gray, fw, fh = self.device_controller.get_gray_frame()
-                if gray is not None and fw == width and fh == height:
-                    frames_gray.append(gray.astype(np.float32))
-                else:
-                    # 尺寸不一致时补零帧（不影响后续融合）
-                    frames_gray.append(np.zeros((height, width), dtype=np.float32))
-                    emit_log("  [警告] Z={:.3f}mm 帧尺寸异常，用零帧替代".format(z_cur))
-
-                emit_progress(int((idx + 1) / n_steps * 70))
-
-            if not self._running:
-                emit_status("已停止", "orange")
-                self._sig_done.emit(False, None)
-                return
-
-            emit_log("  采帧完成：共 {} 帧，Z 范围 {:.3f}~{:.3f}mm".format(
-                len(frames_gray), z_positions[-1], z_positions[0]))
-
-            # ── 步骤 4：DFF 焦点融合 ──
-            emit_status("步骤 4/4：DFF 焦点融合中…")
-            emit_progress(75)
-            depth_map, sharp_map, intensity_map = compute_dff_volume(
-                frames_gray, z_positions
-            )
             emit_progress(88)
 
             if intensity_map is None:
                 emit_status("错误：融合失败，没有有效图像数据", "red")
                 self._sig_done.emit(False, None)
                 return
+            reference_map, reference_z, reference_score = select_best_single_frame(frames_gray, z_positions)
+            reference_color_map = None
+            if reference_z is not None and frames_color:
+                for idx, z_pos in enumerate(z_positions):
+                    if float(z_pos) == float(reference_z) and idx < len(frames_color):
+                        reference_color_map = frames_color[idx]
+                        break
+            if reference_map is not None:
+                emit_log("最佳单帧：Z={:.3f}mm".format(float(reference_z)))
 
             # 保存深度图和图像尺寸到成员变量
             self._depth_map = depth_map
@@ -490,39 +654,48 @@ class OneClickDialog(QDialog):
                 )
                 self._point_cloud = point_cloud
                 point_count = len(point_cloud)
-                emit_log("  点云生成完成：{:,} 点，覆盖率 {:.1f}%".format(point_count, coverage))
+                emit_log("点云：{:,} 点，覆盖率 {:.1f}%".format(point_count, coverage))
 
-            # ── 自动保存 ──
+            # ── 自动保存完整输出包 ──
             save_dir = self.config_manager.effective_save_path()
-            ensure_dir(save_dir)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_path = os.path.join(save_dir, "composite_{}.bmp".format(ts))
+            emit_status("保存文件中… 请稍候", "blue")
+            emit_progress(92)
             try:
-                save_composite_image(intensity_map, save_path)
+                output_params = {
+                    "zh": z_high,
+                    "zl": z_low,
+                    "step": z_step,
+                    "mode": "cxf" if params.get("coarse_fine") else "scan",
+                    "zscale": z_scale if gen_pointcloud else None,
+                    "sharp": min_sharp if gen_pointcloud else None,
+                }
+                output_paths = save_output_bundle(
+                    save_dir,
+                    "oneclick",
+                    intensity_map,
+                    depth_map,
+                    self._point_cloud,
+                    self.config_manager.pixels_per_mm,
+                    params=output_params,
+                    z_scale=z_scale,
+                    comment="Generated by OneClick Dialog",
+                    reference_map=reference_map,
+                    reference_label="best Z={:.3f} mm".format(float(reference_z)) if reference_z is not None else "best single frame",
+                    color_map=color_map,
+                    reference_color_map=reference_color_map,
+                )
+                self._last_output_paths = output_paths
+                save_path = output_paths.get("full_focus", "")
                 self._last_save_path = save_path
-                emit_log("  已保存合成图：{}".format(save_path))
+                emit_log("保存：{}".format(save_dir))
             except Exception as exc:
                 emit_log("  [警告] 自动保存失败：{}".format(exc))
                 save_path = "（保存失败）"
 
             emit_progress(100)
 
-            # ── 输出日志摘要 ──
-            emit_log("─" * 48)
-            emit_log("出图摘要")
-            emit_log("  拍摄方向  ：从上向下（Z {:.3f} → {:.3f} mm）".format(
-                z_positions[0], z_positions[-1]))
-            emit_log("  步数      ：{}".format(len(frames_gray)))
-            emit_log("  步长      ：{:.3f} mm（负方向）".format(z_step))
-            emit_log("  图像尺寸  ：{}×{}".format(width, height))
-            emit_log("  融合方式  ：DFF 焦点融合")
-            emit_log("  输出路径  ：{}".format(save_path))
-            if gen_pointcloud:
-                emit_log("  点云数据  ：{:,} 点（覆盖率 {:.1f}%）".format(point_count, coverage))
-            emit_log("═" * 48)
-
             # 构建状态消息
-            status_msg = "出图完成！已保存 {}×{} 合成图\n路径：{}".format(width, height, save_path)
+            status_msg = "完成：{}×{}，目录：{}".format(width, height, save_dir)
             if gen_pointcloud:
                 status_msg += "\n点云：{:,} 点".format(point_count)
 
@@ -567,14 +740,14 @@ class OneClickDialog(QDialog):
             if self._last_save_path
             else self.config_manager.effective_save_path()
         )
-        default_name = "composite_{}.bmp".format(
+        default_name = "composite_{}.png".format(
             datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "另存合成图",
             os.path.join(default_dir, default_name),
-            "BMP 图像 (*.bmp);;PNG 图像 (*.png);;全部文件 (*.*)",
+            "PNG 图像 (*.png);;TIFF 图像 (*.tif *.tiff);;BMP 图像 (*.bmp);;全部文件 (*.*)",
         )
         if not file_path:
             return
@@ -589,56 +762,74 @@ class OneClickDialog(QDialog):
 
     # ── 可视化点云 ─────────────────────────────────────────────
     def _visualize_point_cloud(self):
-        if self._point_cloud is None or len(self._point_cloud) == 0:
-            QMessageBox.warning(self, "提示", "暂无点云数据，请先勾选「生成点云数据」并执行出图。")
+        if self._depth_map is None or self._point_cloud is None or len(self._point_cloud) == 0:
+            QMessageBox.warning(self, "提示", "暂无点云/深度图数据，请先勾选「自动输出三维点云」并执行出图。")
             return
         try:
             import matplotlib
             matplotlib.use("Qt5Agg")
             import matplotlib.pyplot as plt
+            import numpy as np
             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
             fp = get_mpl_font()
             title_kw = {"fontproperties": fp} if fp else {}
             fig = plt.figure(figsize=(14, 6))
-            fig.suptitle("一键出图 - 点云数据", fontsize=14, **title_kw)
+            fig.suptitle("一键出图结果 - 点云数据", fontsize=14, **title_kw)
 
-            # 左侧：深度图
+            ppmm = self.config_manager.pixels_per_mm if self.config_manager.pixels_per_mm > 0 else 1.0
+            width, height = self._img_size
+            depth = np.asarray(self._depth_map, dtype=np.float32)
+            finite = depth[np.isfinite(depth)]
+            depth_show = depth - float(np.nanpercentile(finite, 2.0)) if finite.size else depth
+            d_valid = depth_show[np.isfinite(depth_show)]
+            d_min = float(np.nanpercentile(d_valid, 2.0))  if d_valid.size else 0.0
+            d_max = float(np.nanpercentile(d_valid, 98.0)) if d_valid.size else 1.0
             ax1 = fig.add_subplot(1, 2, 1)
-            if self._depth_map is not None:
-                width, height = self._img_size
-                ppmm = self.config_manager.pixels_per_mm
-                image = ax1.imshow(
-                    self._depth_map,
-                    cmap="plasma",
-                    origin="upper",
-                    extent=[
-                        -width / (2 * ppmm),
-                        width / (2 * ppmm),
-                        height / (2 * ppmm),
-                        -height / (2 * ppmm),
-                    ],
-                )
-                plt.colorbar(image, ax=ax1).set_label("Depth (mm)")
-                ax1.set_title("Depth Map", **title_kw)
-                ax1.set_xlabel("X (mm)")
-                ax1.set_ylabel("Y (mm)")
+            image = ax1.imshow(
+                depth_show,
+                cmap="plasma",
+                origin="upper",
+                vmin=d_min, vmax=d_max,
+                extent=[-width / (2 * ppmm), width / (2 * ppmm), height / (2 * ppmm), -height / (2 * ppmm)],
+            )
+            cbar = plt.colorbar(image, ax=ax1)
+            cbar.set_label("相对深度 (mm)", fontproperties=fp if fp else None)
+            cbar.ax.text(0.5, 1.02, "黑紫=高(近)", transform=cbar.ax.transAxes,
+                         ha="center", va="bottom", fontsize=8, color="#333")
+            cbar.ax.text(0.5, -0.04, "黄=低(远)", transform=cbar.ax.transAxes,
+                         ha="center", va="top", fontsize=8, color="#333")
+            step = max(1, depth_show.shape[0] // 300)
+            ds = depth_show[::step, ::step]
+            xc = np.linspace(-width / (2 * ppmm), width / (2 * ppmm), ds.shape[1])
+            yc = np.linspace(-height / (2 * ppmm), height / (2 * ppmm), ds.shape[0])
+            levels = np.linspace(d_min, d_max, 8)[1:-1]
+            try:
+                cs = ax1.contour(xc, yc, ds, levels=levels, colors="white", linewidths=0.6, alpha=0.75)
+                ax1.clabel(cs, fmt="%.2f mm", fontsize=7, inline=True, inline_spacing=4)
+            except Exception:
+                pass
+            ax1.set_title("深度图  (黑紫=高面 / 黄=低面)", **title_kw)
+            ax1.set_xlabel("X (mm)")
+            ax1.set_ylabel("Y (mm)")
 
-            # 右侧：3D 点云
-            ax2 = fig.add_subplot(1, 2, 2, projection="3d")
-            points = self._point_cloud
-            x, y, z, intensity = points[:, 0], points[:, 1], points[:, 2], points[:, 3]
-            # 限制显示点数以提高性能
-            max_plot = 60000
-            if len(x) > max_plot:
-                index = np.random.choice(len(x), max_plot, replace=False)
+            pc = self._point_cloud
+            x, y, z, intensity = pc[:, 0], pc[:, 1], pc[:, 2], pc[:, 3]
+            max_pts = 80000
+            if len(x) > max_pts:
+                index = np.random.default_rng(42).choice(len(x), max_pts, replace=False)
                 x, y, z, intensity = x[index], y[index], z[index], intensity[index]
-            scatter = ax2.scatter(x, y, z, c=intensity, cmap="gray", s=0.5, alpha=0.6)
-            plt.colorbar(scatter, ax=ax2, label="Intensity")
+            ax2 = fig.add_subplot(1, 2, 2, projection="3d")
+            scatter = ax2.scatter(x, y, z, c=z, cmap="turbo", s=0.35, alpha=0.70, linewidths=0)
+            plt.colorbar(scatter, ax=ax2, label="Relative height (mm)")
             ax2.set_xlabel("X (mm)")
             ax2.set_ylabel("Y (mm)")
             ax2.set_zlabel("Z (mm)")
             ax2.set_title("Point Cloud ({:,} pts)".format(len(self._point_cloud)), **title_kw)
+            try:
+                ax2.set_box_aspect((max(float(np.ptp(x)), 1e-6), max(float(np.ptp(y)), 1e-6), max(float(np.ptp(z)), 1e-6)))
+            except Exception:
+                pass
             plt.tight_layout()
             plt.show()
         except ImportError:
@@ -657,7 +848,7 @@ class OneClickDialog(QDialog):
             self,
             "导出点云",
             os.path.join(self.config_manager.effective_save_path(), default_name),
-            "PLY 文件 (*.ply);;CSV 文件 (*.csv);;全部文件 (*.*)",
+            "PLY 文件 (*.ply);;OBJ 文件 (*.obj);;CSV 文件 (*.csv);;全部文件 (*.*)",
         )
         if not file_path:
             return
@@ -675,3 +866,4 @@ class OneClickDialog(QDialog):
             )
         except Exception as exc:
             QMessageBox.warning(self, "导出错误", str(exc))
+

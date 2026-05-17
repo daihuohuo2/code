@@ -7,7 +7,7 @@ from dataclasses import dataclass
 class AppConfig:
     save_path: str = ""
     serial_port: str = ""
-    baud_rate: str = "115200"
+    baud_rate: str = "19200"
     serial_timeout: str = "1.0"
     pixels_per_mm: float = 100.0
 
@@ -24,7 +24,7 @@ class ConfigManager:
             parser.read(self.settings_file, encoding="utf-8")
             self.config.save_path = parser.get("Settings", "save_path", fallback="")
             self.config.serial_port = parser.get("Serial", "port", fallback="")
-            self.config.baud_rate = parser.get("Serial", "baud_rate", fallback="115200")
+            self.config.baud_rate = parser.get("Serial", "baud_rate", fallback="19200")
             self.config.serial_timeout = parser.get("Serial", "timeout", fallback="1.0")
             try:
                 self.config.pixels_per_mm = float(

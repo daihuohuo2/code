@@ -3,19 +3,29 @@ import threading
 import time
 from datetime import datetime
 
-from PyQt5.QtCore import QTimer, Qt
-from PyQt5.QtWidgets import QFileDialog, QInputDialog, QMainWindow, QMessageBox
+from PyQt5.QtCore import QTimer, Qt, pyqtSignal
+from PyQt5.QtWidgets import QFileDialog, QMainWindow, QMessageBox
 
 from sdk.MvErrorDefine_const import MV_E_PARAMETER, MV_OK
-from algorithms import compute_sharpness_score, ensure_dir, phase_correlation_shift
+from algorithms import (
+    CALIB_DOT_SPACING_UM,
+    compute_blob_scale_calibration,
+    ensure_dir,
+    phase_correlation_shift,
+)
 from config_manager import ConfigManager
 from device_controller import DeviceController, SERIAL_AVAILABLE, to_hex_str
-from dialogs import PointCloudReconDialog, TemporalDepthDialog, OneClickDialog
+from dialogs import PointCloudReconDialog, TemporalDepthDialog, OneClickDialog, ProgrammableShootingDialog
 from overlays import ResizeFilter, ScaleBarOverlay
 from ui import Ui_MainWindow
 
 
 class MainWindow(QMainWindow):
+    _quick_scale_done = pyqtSignal(dict)   # 线程安全：blob结果 → 主线程更新UI
+    _quick_scale_fail = pyqtSignal(str)    # 线程安全：错误信息 → 主线程弹窗
+    DEFAULT_EXPOSURE_US = 80000.0
+    DEFAULT_GAIN_DB = 5.0
+
     def __init__(self):
         super().__init__()
         self.ui = Ui_MainWindow()
@@ -29,23 +39,37 @@ class MainWindow(QMainWindow):
 
         self.auto_capture_running = False
         self.autofocus_running = False
-        self.auto_calib_running = False
+        self.quick_scale_running = False
         self.dark_frame_captured = False
+        self._z_at_home = False
         self._cam_img_width = 0
         self._recon3d_dialog = None
         self._temporal_depth_dialog = None
         self._one_click_dialog = None
+        self._programmable_dialog = None
         self._cleaned_up = False
+        self._z_poll_busy = False
+
+        # 强制为预览 widget 分配独立原生 HWND，并阻止 Qt 双缓冲覆盖，
+        # 确保 SDK 的 MV_CC_DisplayOneFrame (GDI) 能正常渲染，不会卡住。
+        self.ui.widgetDisplay.setAttribute(Qt.WA_NativeWindow, True)
+        self.ui.widgetDisplay.setAttribute(Qt.WA_PaintOnScreen, True)
 
         self.scale_overlay = ScaleBarOverlay(self.ui.widgetDisplay)
         self._resize_filter = ResizeFilter(self.scale_overlay)
         self.ui.widgetDisplay.installEventFilter(self._resize_filter)
+        self.ui.centralWidget.installEventFilter(self._resize_filter)
+        self.installEventFilter(self._resize_filter)   # 主窗口移动时更新叠加层位置
 
         self._bind_signals()
         self._create_menu()
         self.load_settings()
         self.scale_overlay.set_visible(self.ui.chkShowScaleBar.isChecked())
         self.enable_controls()
+        self._z_timer = QTimer(self)
+        self._z_timer.timeout.connect(self.refresh_z_position)
+        self._z_timer.start(1000)
+        self._update_z_display()
 
     def _bind_signals(self):
         self.ui.bnEnum.clicked.connect(self.enum_devices)
@@ -57,8 +81,6 @@ class MainWindow(QMainWindow):
         self.ui.bnGetParam.clicked.connect(self.get_param)
         self.ui.bnSetParam.clicked.connect(self.set_param)
 
-        self.ui.bnAutoCapture.clicked.connect(self.start_auto_capture)
-        self.ui.bnSetSavePath.clicked.connect(self.set_save_path)
         self.ui.bnAutoFocus.clicked.connect(self.start_autofocus)
         self.ui.bnStopAutoFocus.clicked.connect(self.stop_autofocus)
         self.ui.bnRefreshPort.clicked.connect(self.refresh_serial_ports)
@@ -73,8 +95,9 @@ class MainWindow(QMainWindow):
         self.ui.bnMoveStep.clicked.connect(self.action_move_z_step)
         self.ui.bnMoveStepDown.clicked.connect(self.action_move_z_step_down)
         self.ui.sliderLight.valueChanged.connect(self.action_slider_light)
-        self.ui.bnSetScaleCalib.clicked.connect(self.apply_scale_calib)
-        self.ui.bnAutoCalib.clicked.connect(self.start_auto_calib)
+        self.ui.bnQuickScale.clicked.connect(self.start_quick_scale)
+        self._quick_scale_done.connect(self._on_quick_scale_done)
+        self._quick_scale_fail.connect(self._on_quick_scale_fail)
         self.ui.bnCaptureDark.clicked.connect(self.capture_dark_frame)
         self.ui.chkDarkSub.stateChanged.connect(self.toggle_dark_sub)
         self.ui.bnClearDark.clicked.connect(self.clear_dark_frame)
@@ -82,43 +105,25 @@ class MainWindow(QMainWindow):
 
     def _create_menu(self):
         menubar = self.menuBar()
-        menu_recon = menubar.addMenu("三维重建(&3D)")
-        action_recon = menu_recon.addAction("① 点云重建...")
+        action_recon = menubar.addAction("点云重建(&3)...")
         action_recon.triggered.connect(self.open_recon3d_dialog)
-        action_temporal = menu_recon.addAction("② 连续扫描重建...")
+        action_temporal = menubar.addAction("连续扫描重建(&S)...")
         action_temporal.triggered.connect(self.open_temporal_depth_dialog)
-        menu_recon.addSeparator()
-        action_help = menu_recon.addAction("使用说明")
-        action_help.triggered.connect(self.show_recon_help)
 
-        menu_imaging = menubar.addMenu("出图(&I)")
-        action_one_click = menu_imaging.addAction("一键出图...")
+        action_one_click = menubar.addAction("一键出图(&I)")
         action_one_click.triggered.connect(self.open_one_click_dialog)
 
-    def show_recon_help(self):
-        QMessageBox.information(
-            self,
-            "三维重建使用说明",
-            "① 点云重建\n"
-            "原理：Z 轴逐步停顿，每步拍一帧，逐像素取锐度最大 Z 值。\n\n"
-            "② 连续扫描重建\n"
-            "原理：Z 轴匀速连续扫描，相机按时间间隔采帧，按时间映射 Z 位置，"
-            "可选嵌套精扫融合。\n\n"
-            "两种模式都支持可视化和导出 .ply / .csv。\n\n"
-            "【出图菜单】一键出图\n"
-            "原理：Z 轴从高位（上）向低位（下）逐步停拍，\n"
-            "DFF 焦点融合生成一张全焦合成图，自动保存为 BMP，并在对话框内预览。",
-        )
+        action_prog = menubar.addAction("可编程拍摄(&P)")
+        action_prog.triggered.connect(self.open_programmable_shooting_dialog)
 
     def load_settings(self):
         config = self.config_manager.load()
-        self._update_path_label()
 
         baud_rates = ["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"]
         self.ui.cmbBaudRate.clear()
         self.ui.cmbBaudRate.addItems(baud_rates)
         baud_index = self.ui.cmbBaudRate.findText(config.baud_rate)
-        self.ui.cmbBaudRate.setCurrentIndex(baud_index if baud_index >= 0 else baud_rates.index("115200"))
+        self.ui.cmbBaudRate.setCurrentIndex(baud_index if baud_index >= 0 else baud_rates.index("19200"))
         self.ui.edtSerialTimeout.setText(config.serial_timeout)
 
         self.refresh_serial_ports()
@@ -130,7 +135,6 @@ class MainWindow(QMainWindow):
         self._update_serial_status()
         self.ui.edtPixelsPerMm.setText("{:.4f}".format(config.pixels_per_mm))
         self.scale_overlay.set_pixels_per_mm(config.pixels_per_mm)
-        self._update_scale_info_label()
 
     def save_settings(self):
         self.config_manager.serial_port = (
@@ -139,9 +143,6 @@ class MainWindow(QMainWindow):
         self.config_manager.baud_rate = self.ui.cmbBaudRate.currentText()
         self.config_manager.serial_timeout = self.ui.edtSerialTimeout.text().strip()
         self.config_manager.save()
-
-    def _update_path_label(self):
-        self.ui.lblSavePathInfo.setText("保存至: " + self.config_manager.effective_save_path())
 
     def enum_devices(self):
         try:
@@ -162,6 +163,9 @@ class MainWindow(QMainWindow):
             if self.ui.ComboDevices.currentIndex() < 0:
                 raise RuntimeError("Please select a camera!")
             params = self.device_controller.open_camera(self.ui.ComboDevices.currentIndex())
+            self.device_controller.set_exposure(self.DEFAULT_EXPOSURE_US)
+            self.device_controller.set_gain(self.DEFAULT_GAIN_DB)
+            params = self.device_controller.get_parameters()
             self.ui.edtExposureTime.setText("{0:.2f}".format(params["exposure_time"]))
             self.ui.edtGain.setText("{0:.2f}".format(params["gain"]))
             self.ui.edtFrameRate.setText("{0:.2f}".format(params["frame_rate"]))
@@ -176,7 +180,9 @@ class MainWindow(QMainWindow):
     def start_grabbing(self):
         try:
             self.device_controller.set_continue_mode()
-            self.device_controller.start_grabbing(self.ui.widgetDisplay.winId())
+            # 调用 winId() 前确保原生 HWND 已分配，防止 GDI 渲染时拿到无效句柄
+            win_id = int(self.ui.widgetDisplay.winId())
+            self.device_controller.start_grabbing(win_id)
             self.enable_controls()
             QTimer.singleShot(800, self.poll_cam_img_width)
         except Exception as exc:
@@ -188,54 +194,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Error", str(exc), QMessageBox.Ok)
         self.enable_controls()
-
-    def set_continue_mode(self):
-        try:
-            self.device_controller.set_continue_mode()
-        except Exception as exc:
-            QMessageBox.warning(self, "Error", str(exc), QMessageBox.Ok)
-
-    def set_save_path(self):
-        new_path = QFileDialog.getExistingDirectory(self, "选择图片保存路径", self.config_manager.effective_save_path())
-        if new_path:
-            self.config_manager.save_path = new_path
-            self.save_settings()
-            self._update_path_label()
-
-    def _auto_capture_worker(self, count):
-        save_dir = self.config_manager.effective_save_path()
-        ensure_dir(save_dir)
-        success_count = 0
-        timestamp_base = datetime.now().strftime("%Y%m%d_%H%M%S")
-        for index in range(count):
-            if not self.auto_capture_running:
-                break
-            file_name = "{}_{:03d}.bmp".format(timestamp_base, index + 1)
-            full_path = os.path.join(save_dir, file_name)
-            try:
-                ret = self.device_controller.save_bmp_with_path(full_path)
-                if ret == MV_OK:
-                    success_count += 1
-                else:
-                    print("Auto capture [{}/{}] failed, ret: {}".format(index + 1, count, to_hex_str(ret)))
-            except Exception as exc:
-                print("Auto capture [{}/{}] error: {}".format(index + 1, count, exc))
-            time.sleep(0.2)
-
-        self.auto_capture_running = False
-        message = "自动拍摄完成！成功保存 {}/{} 张图片\n保存路径: {}".format(success_count, count, save_dir)
-        QTimer.singleShot(0, lambda: QMessageBox.information(self, "完成", message))
-
-    def start_auto_capture(self):
-        if self.auto_capture_running:
-            QMessageBox.warning(self, "提示", "自动拍摄正在进行中！", QMessageBox.Ok)
-            return
-        count_str = self.ui.edtCaptureCount.text().strip()
-        if not count_str.isdigit() or int(count_str) <= 0:
-            QMessageBox.warning(self, "错误", "请输入正整数！", QMessageBox.Ok)
-            return
-        self.auto_capture_running = True
-        threading.Thread(target=self._auto_capture_worker, args=(int(count_str),), daemon=True).start()
 
     def get_param(self):
         try:
@@ -284,6 +242,8 @@ class MainWindow(QMainWindow):
             self.ui.lblSerialStatus.setText("● 未连接")
             self.ui.lblSerialStatus.setStyleSheet("color: red; font-weight: bold;")
             self.ui.bnConnectSerial.setText("连接串口")
+        self._update_z_motion_buttons()
+        self._update_z_display()
 
     def connect_serial(self):
         if not SERIAL_AVAILABLE:
@@ -305,6 +265,7 @@ class MainWindow(QMainWindow):
             self.device_controller.connect_serial(port, baud, timeout)
             self.config_manager.serial_port = port
             self._update_serial_status()
+            self._sync_z_from_device(show_error=False)
             self.save_settings()
             # Send default brightness
             self.send_gcode("M106 S{}\n".format(self.ui.sliderLight.value()))
@@ -321,151 +282,425 @@ class MainWindow(QMainWindow):
             return False
 
     def action_home_z(self):
-        self.send_gcode("G28 Z\n")
+        try:
+            self.device_controller.home_z_wait()
+            self._z_at_home = True
+            self._update_z_motion_buttons()
+            self._update_z_display()
+        except Exception as exc:
+            QMessageBox.warning(self, "Z 轴归零失败", str(exc), QMessageBox.Ok)
+
+    def _sync_z_from_device(self, show_error=False):
+        try:
+            self.device_controller.refresh_z_position(timeout=0.8)
+            self._z_at_home = self.device_controller._z_position <= 0.001
+            self._update_z_motion_buttons()
+            self._update_z_display()
+            return True
+        except Exception as exc:
+            if show_error:
+                QMessageBox.warning(self, "Z 轴位置读取失败", str(exc), QMessageBox.Ok)
+            return False
+
+    def refresh_z_position(self):
+        if self._z_poll_busy or not self.device_controller.serial_connected:
+            return
+        self._z_poll_busy = True
+
+        def worker():
+            try:
+                self.device_controller.refresh_z_position(timeout=0.6)
+                QTimer.singleShot(0, self._update_z_display)
+            finally:
+                self._z_poll_busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_z_display(self):
+        """刷新主界面和所有已打开 dialog 的 Z 位置显示。"""
+        z = self.device_controller._z_position
+        min_limit = getattr(self.device_controller, "_z_min_limit", 0.0)
+        max_limit = getattr(self.device_controller, "_z_soft_limit", 68.0)
+        self.ui.lblZPos.setText("实时 Z 位置: {:.3f} mm".format(z))
+        if hasattr(self.ui, "lblZMinLimit"):
+            self.ui.lblZMinLimit.setText("最低提醒: {:.1f} mm".format(min_limit))
+        if hasattr(self.ui, "lblZMaxLimit"):
+            self.ui.lblZMaxLimit.setText("最高提醒: {:.1f} mm".format(max_limit))
+        if z <= min_limit or z >= max_limit:
+            z_color = "#d80000"
+            border = "#d80000"
+        elif z <= min_limit + 1.0 or z >= max_limit - 5.0:
+            z_color = "#b56a00"
+            border = "#ffb000"
+        else:
+            z_color = "#0078d7"
+            border = "#0078d7"
+        self.ui.lblZPos.setStyleSheet(
+            "font-size: 16px; font-weight: bold; color: {};"
+            "background: #ffffff; border: 1px solid {}; border-radius: 4px; padding: 3px;".format(z_color, border)
+        )
+        if hasattr(self.ui, "lblZMinLimit"):
+            min_color = "#d80000" if z <= min_limit else "#b56a00" if z <= min_limit + 1.0 else "#444444"
+            self.ui.lblZMinLimit.setStyleSheet(
+                "font-size: 12px; font-weight: bold; color: {};"
+                "background: #ffffff; border: 1px solid #cccccc; border-radius: 4px; padding: 3px;".format(min_color)
+            )
+        if hasattr(self.ui, "lblZMaxLimit"):
+            max_color = "#d80000" if z >= max_limit else "#b56a00" if z >= max_limit - 5.0 else "#444444"
+            self.ui.lblZMaxLimit.setStyleSheet(
+                "font-size: 12px; font-weight: bold; color: {};"
+                "background: #ffffff; border: 1px solid #cccccc; border-radius: 4px; padding: 3px;".format(max_color)
+            )
+        self.ui.lblZPos.setToolTip(
+            "Z 轴最低提醒点 {:.1f} mm，最高提醒点 {:.1f} mm；接近端点请谨慎调整。".format(
+                min_limit, max_limit
+            )
+        )
+
+    def _update_z_motion_buttons(self):
+        """Keep manual Z adjustment available; soft limit remains enforced in DeviceController."""
+        serial_ready = self.device_controller.serial_connected
+        for button in (
+            self.ui.bnCoarseUp,
+            self.ui.bnCoarseDown,
+            self.ui.bnMediumUp,
+            self.ui.bnMediumDown,
+            self.ui.bnFineUp,
+            self.ui.bnFineDown,
+            self.ui.bnMoveStep,
+            self.ui.bnMoveStepDown,
+        ):
+            button.setEnabled(serial_ready)
 
     def action_coarse_up(self):
-        self.send_gcode("G91\nG1 Z1.00 F2000\nG90\n")
+        self._move_z_relative_from_ui(1.00)
 
     def action_coarse_down(self):
-        self.send_gcode("G91\nG1 Z-1.00 F2000\nG90\n")
+        self._move_z_relative_from_ui(-1.00)
 
     def action_medium_up(self):
-        self.send_gcode("G91\nG1 Z0.10 F2000\nG90\n")
+        self._move_z_relative_from_ui(0.10)
 
     def action_medium_down(self):
-        self.send_gcode("G91\nG1 Z-0.10 F2000\nG90\n")
+        self._move_z_relative_from_ui(-0.10)
 
     def action_fine_up(self):
-        self.send_gcode("G91\nG1 Z0.05 F2000\nG90\n")
+        self._move_z_relative_from_ui(0.05)
 
     def action_fine_down(self):
-        self.send_gcode("G91\nG1 Z-0.05 F2000\nG90\n")
+        self._move_z_relative_from_ui(-0.05)
 
     def action_move_z_step(self):
-        self.send_gcode("G91\nG1 Z0.005 F2000\nG90\n")
+        self._move_z_relative_from_ui(0.005)
 
     def action_move_z_step_down(self):
-        self.send_gcode("G91\nG1 Z-0.005 F2000\nG90\n")
+        self._move_z_relative_from_ui(-0.005)
+
+    def _move_z_relative_from_ui(self, step_mm):
+        try:
+            self.device_controller.move_z_relative_wait(step_mm, feed=2000)
+            self._z_at_home = self.device_controller._z_position <= 0.001
+            self._update_z_motion_buttons()
+            self._update_z_display()
+        except Exception as exc:
+            QMessageBox.warning(self, "Z 轴移动失败", str(exc), QMessageBox.Ok)
 
     def action_slider_light(self, value):
         self.ui.lblLightValue.setText(str(value))
         self.send_gcode("M106 S{}\n".format(value))
 
     def poll_cam_img_width(self):
-        if self.device_controller.grabbing:
-            try:
-                _, width, _ = self.device_controller.get_frame_numpy()
-                if width > 0:
-                    self._cam_img_width = width
-                    self.scale_overlay.set_img_width(width)
-            except Exception:
-                pass
-
-    def apply_scale_calib(self):
-        try:
-            value = float(self.ui.edtPixelsPerMm.text().strip())
-            if value <= 0:
-                raise ValueError
-        except ValueError:
-            QMessageBox.warning(self, "输入错误", "请输入有效的正数（像素/mm）。", QMessageBox.Ok)
+        if not self.device_controller.grabbing:
             return
-        self.config_manager.pixels_per_mm = value
-        if self.device_controller.grabbing:
-            self.poll_cam_img_width()
-        self.scale_overlay.set_pixels_per_mm(value)
-        self._update_scale_info_label()
-        self.save_settings()
+        try:
+            _, width, _ = self.device_controller.get_frame_numpy()
+            if width > 0:
+                self._cam_img_width = width
+                self.scale_overlay.set_img_width(width)
+        except Exception:
+            pass
 
     def toggle_scale_bar(self, state):
         self.scale_overlay.set_visible(state == Qt.Checked)
+        self.scale_overlay.update_size()
 
-    def _update_scale_info_label(self):
-        ppmm = self.config_manager.pixels_per_mm
-        if ppmm <= 0:
-            self.ui.lblScaleBarInfo.setText("未标定")
-            return
-        self.ui.lblScaleBarInfo.setText("1mm={:.1f}px | {:.3f}µm/px".format(ppmm, 1000.0 / ppmm))
+    def _set_quick_scale_status(self, message):
+        self.ui.lblQuickScaleStatus.setText(message)
 
-    def _compute_sharpness(self):
-        import numpy as np
-        gray, width, height = self.device_controller.get_gray_frame()
-        if gray is None or width == 0 or height == 0:
-            return 0.0
-        # Use center ROI (1/4 area) for faster computation
-        cy, cx = height // 2, width // 2
-        rh, rw = height // 4, width // 4
-        roi = gray[cy - rh:cy + rh, cx - rw:cx + rw]
-        # Downsample 2x for speed
-        roi = roi[::2, ::2]
-        return compute_sharpness_score(roi)
-
-    def _get_image_brightness(self):
-        """Get mean brightness of center ROI (0-255 range)."""
-        import numpy as np
-        gray, width, height = self.device_controller.get_gray_frame()
-        if gray is None or width == 0 or height == 0:
-            return 128.0
-        cy, cx = height // 2, width // 2
-        rh, rw = height // 4, width // 4
-        roi = gray[cy - rh:cy + rh, cx - rw:cx + rw]
-        return float(np.mean(roi))
-
-    def _af_auto_expose(self, set_status):
-        """Auto-adjust exposure and gain for optimal image brightness.
-        Target: mean brightness ~120 (out of 255). Adjusts exposure first, then gain."""
-        TARGET_BRIGHTNESS = 120.0
-        TOLERANCE = 20.0
-        MAX_ITERATIONS = 8
-        # Exposure limits (microseconds)
-        EXP_MIN = 1000.0      # 1ms
-        EXP_MAX = 200000.0    # 200ms
-        # Gain limits (dB)
-        GAIN_MIN = 0.0
-        GAIN_MAX = 15.0
+    def _quick_scale_worker(self):
+        def set_status(message):
+            QTimer.singleShot(0, lambda m=message: self._set_quick_scale_status(m))
 
         try:
-            params = self.device_controller.get_parameters()
-            current_exp = params["exposure_time"]
-            current_gain = params["gain"]
-        except Exception:
-            current_exp = 30000.0
-            current_gain = 0.0
+            import time as _time
+            set_status("识别圆点中… 取帧")
+            gray, width, height = self.device_controller.get_gray_frame()
+            if gray is None or width == 0 or height == 0:
+                raise ValueError("无法获取当前图像，请确认相机正在采集")
 
-        # Clamp to sane range
+            set_status("识别圆点中… blob检测")
+            try:
+                spacing_um = float(self.ui.edtDotSpacing.text())
+            except ValueError:
+                spacing_um = CALIB_DOT_SPACING_UM
+            result = compute_blob_scale_calibration(gray, spacing_um=spacing_um)
+            self._quick_scale_done.emit(result)
+        except Exception as exc:
+            self._quick_scale_fail.emit(str(exc))
+        finally:
+            self.quick_scale_running = False
+            QTimer.singleShot(0, self.enable_controls)
+
+    def _on_quick_scale_done(self, result):
+        try:
+            ppmm = result["pixels_per_mm"]
+            self.config_manager.pixels_per_mm = ppmm
+            self.ui.edtPixelsPerMm.setText("{:.4f}".format(ppmm))
+            self.scale_overlay.set_pixels_per_mm(ppmm)
+            self.save_settings()
+            self.ui.chkShowScaleBar.setChecked(True)
+            self.scale_overlay.set_visible(True)
+            if self.device_controller.grabbing:
+                self.poll_cam_img_width()
+            try:
+                spacing_um = float(self.ui.edtDotSpacing.text())
+            except ValueError:
+                spacing_um = CALIB_DOT_SPACING_UM
+            self.ui.lblQuickScaleStatus.setText(
+                "完成 ✓ {}点 | {:.2f}px≈{}µm".format(
+                    result["blob_count"], result["spacing_px"], int(spacing_um)
+                )
+            )
+        except Exception as e:
+            self.ui.lblQuickScaleStatus.setText("UI更新失败: " + str(e))
+
+    def _on_quick_scale_fail(self, message):
+        self.ui.lblQuickScaleStatus.setText("失败: " + message)
+        QMessageBox.warning(self, "快速比例尺", message, QMessageBox.Ok)
+
+    def start_quick_scale(self):
+        if not self.device_controller.grabbing:
+            QMessageBox.warning(self, "错误", "请先开始采集！", QMessageBox.Ok)
+            return
+        if self.quick_scale_running:
+            QMessageBox.warning(self, "提示", "快速比例尺正在进行中！", QMessageBox.Ok)
+            return
+        self.quick_scale_running = True
+        self.ui.bnQuickScale.setEnabled(False)
+        self.ui.lblQuickScaleStatus.setText("识别圆点中…")
+        threading.Thread(target=self._quick_scale_worker, daemon=True).start()
+
+    @staticmethod
+    def _normalize_gray_for_analysis(gray):
+        import numpy as np
+
+        arr = np.asarray(gray, dtype=np.float32)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return np.zeros(arr.shape, dtype=np.float32)
+        p999 = float(np.percentile(finite, 99.9))
+        if p999 <= 255.0:
+            return np.clip(arr, 0.0, 255.0).astype(np.float32)
+        sensor_max = 4095.0 if p999 <= 4095.0 else 65535.0
+        return np.clip(arr / sensor_max * 255.0, 0.0, 255.0).astype(np.float32)
+
+    def _get_center_roi(self, roi_fraction=0.55):
+        gray, width, height = self.device_controller.get_gray_frame()
+        if gray is None or width == 0 or height == 0:
+            return None
+        cy, cx = height // 2, width // 2
+        rh = max(8, int(height * roi_fraction * 0.5))
+        rw = max(8, int(width * roi_fraction * 0.5))
+        roi = gray[max(0, cy - rh):min(height, cy + rh), max(0, cx - rw):min(width, cx + rw)]
+        if roi.size == 0:
+            return None
+        if roi.size > 450000:
+            roi = roi[::2, ::2]
+        return roi
+
+    def _compute_sharpness(self, sample_count=1, roi_fraction=0.65):
+        import numpy as np
+
+        scores = []
+        for _ in range(max(1, int(sample_count))):
+            roi_raw = self._get_center_roi(roi_fraction=roi_fraction)
+            if roi_raw is None:
+                continue
+            # 仅做位深归一化到 8-bit，不做局部对比度均衡化
+            # 均衡化会把离焦产生的干涉条纹拉伸成"高梯度"，导致误判为焦点
+            roi_f = self._normalize_gray_for_analysis(roi_raw)
+            p02 = float(np.percentile(roi_f, 2.0))
+            p10 = float(np.percentile(roi_f, 10.0))
+            p50 = float(np.percentile(roi_f, 50.0))
+            p90 = float(np.percentile(roi_f, 90.0))
+            p98 = float(np.percentile(roi_f, 98.0))
+            contrast = p90 - p10
+            if contrast < 8.0:
+                scores.append(0.0)
+                continue
+
+            # 牙体是半透明且强反光的目标，高光点和背景纤维会误导普通全局锐度。
+            # 这里仅保留中间亮度的主体像素，并用高分位梯度强调真实纹理/沟槽。
+            body_low = max(p02 + 6.0, p50 - 55.0)
+            body_high = min(p98 - 10.0, p50 + 85.0, 238.0)
+            mask = (roi_f >= body_low) & (roi_f <= body_high)
+            if float(np.mean(mask)) < 0.18:
+                mask = (roi_f >= p10) & (roi_f <= min(p98, 242.0))
+
+            gx = np.zeros_like(roi_f, dtype=np.float32)
+            gy = np.zeros_like(roi_f, dtype=np.float32)
+            gx[:, 1:-1] = roi_f[:, 2:] - roi_f[:, :-2]
+            gy[1:-1, :] = roi_f[2:, :] - roi_f[:-2, :]
+            grad2 = gx * gx + gy * gy
+            lap = np.zeros_like(roi_f, dtype=np.float32)
+            lap[1:-1, 1:-1] = (
+                roi_f[:-2, 1:-1]
+                + roi_f[2:, 1:-1]
+                + roi_f[1:-1, :-2]
+                + roi_f[1:-1, 2:]
+                - 4.0 * roi_f[1:-1, 1:-1]
+            )
+            valid_grad = grad2[mask]
+            valid_lap = (lap * lap)[mask]
+            if valid_grad.size < 64:
+                scores.append(0.0)
+                continue
+
+            tenengrad_hi = float(np.percentile(valid_grad, 92.0))
+            lap_hi = float(np.percentile(valid_lap, 92.0))
+            local_contrast = float(np.percentile(roi_f[mask], 90.0) - np.percentile(roi_f[mask], 10.0))
+            highlight_penalty = 1.0 / (1.0 + max(0.0, float(np.mean(roi_f >= 248.0)) - 0.003) * 80.0)
+            contrast_weight = max(0.15, min(1.0, local_contrast / 80.0))
+            scores.append((0.65 * tenengrad_hi + 0.35 * lap_hi) * contrast_weight * highlight_penalty)
+            if sample_count > 1:
+                time.sleep(0.04)
+        if not scores:
+            return 0.0
+        return float(np.median(scores))
+
+    def _get_exposure_stats(self):
+        import numpy as np
+
+        roi = self._get_center_roi(roi_fraction=0.75)
+        if roi is None:
+            return {
+                "mean": 128.0, "p50": 128.0, "p95": 180.0, "p99": 220.0,
+                "p70": 150.0, "bright_pct": 0.0, "dark_pct": 0.0,
+                "subject_pct": 0.0, "meter": "fallback"
+            }
+        roi_u8 = self._normalize_gray_for_analysis(roi)
+        flat = roi_u8.reshape(-1)
+
+        # 背景很亮、主体偏暗时，全局均值/高分位会被背景带偏。
+        # 用 Otsu 把中央 ROI 分成亮/暗两类，优先对暗类主体测光。
+        hist, _ = np.histogram(flat, bins=256, range=(0.0, 255.0))
+        total = float(flat.size)
+        indices = np.arange(256, dtype=np.float64)
+        weight_bg = np.cumsum(hist).astype(np.float64)
+        weight_fg = total - weight_bg
+        sum_bg = np.cumsum(hist * indices)
+        sum_total = sum_bg[-1]
+        valid = (weight_bg > 0.0) & (weight_fg > 0.0)
+        mean_bg = np.zeros_like(indices)
+        mean_fg = np.zeros_like(indices)
+        mean_bg[valid] = sum_bg[valid] / weight_bg[valid]
+        mean_fg[valid] = (sum_total - sum_bg[valid]) / weight_fg[valid]
+        between = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        threshold = float(np.argmax(between))
+
+        dark_mask = roi_u8 <= min(205.0, max(45.0, threshold + 8.0))
+        dark_mask &= roi_u8 >= 4.0
+        dark_fraction = float(np.mean(dark_mask))
+        if 0.04 <= dark_fraction <= 0.88:
+            metered = roi_u8[dark_mask]
+            meter = "subject"
+        else:
+            metered = flat
+            meter = "center"
+
+        return {
+            "mean": float(np.mean(metered)),
+            "p50": float(np.percentile(metered, 50.0)),
+            "p70": float(np.percentile(metered, 70.0)),
+            "p95": float(np.percentile(metered, 95.0)),
+            "p99": float(np.percentile(metered, 99.0)),
+            "bright_pct": float(np.mean(metered >= 248.0)),
+            "dark_pct": float(np.mean(metered <= 8.0)),
+            "subject_pct": dark_fraction,
+            "meter": meter,
+        }
+
+    def _get_image_brightness(self):
+        """Get center ROI median brightness normalized to 0-255."""
+        return self._get_exposure_stats()["p50"]
+
+    def _af_auto_expose(self, set_status):
+        """Auto-adjust exposure and gain before focusing.
+
+        核心策略：先从中央 ROI 中分离偏暗主体，再对主体亮度测光。
+        白背景可以过亮一些，主体纹理必须先被拉起来。
+
+        关键修复：settle 时间按当前曝光值动态计算，避免读到旧帧。
+        曝光上限 AF_EXP_CAP 防止曝光值失控性增长。
+        """
+        TARGET_P70 = 125.0    # 主体中高亮度目标，保留纹理不过曝
+        OVEREXP_P99 = 245.0   # 主体 p99 超过此值视为过曝
+        AF_EXP_CAP = 80000.0  # 自动对焦期间曝光上限 80ms（≥12fps）
+        MAX_ITERATIONS = 8
+        EXP_MIN = 10.0
+        EXP_MAX = 1000000.0
+        GAIN_MIN = 0.0
+        GAIN_MAX = 10.0
+
+        try:
+            self.device_controller.set_exposure(self.DEFAULT_EXPOSURE_US)
+            self.device_controller.set_gain(self.DEFAULT_GAIN_DB)
+            current_exp = self.DEFAULT_EXPOSURE_US
+            current_gain = self.DEFAULT_GAIN_DB
+        except Exception:
+            current_exp = self.DEFAULT_EXPOSURE_US
+            current_gain = self.DEFAULT_GAIN_DB
+
         current_exp = max(EXP_MIN, min(EXP_MAX, current_exp))
         current_gain = max(GAIN_MIN, min(GAIN_MAX, current_gain))
 
         for iteration in range(MAX_ITERATIONS):
-            time.sleep(0.15)  # wait for new frame with updated exposure
-            brightness = self._get_image_brightness()
+            if not self.autofocus_running:
+                return
+            # settle 时间 = max(0.12s, 当前曝光时间×2.2 + 50ms)
+            # 保证相机至少输出 2 帧新曝光画面后再读统计
+            settle_s = max(0.12, min(0.70, current_exp / 1e6 * 2.2 + 0.05))
+            time.sleep(settle_s)
+
+            stats = self._get_exposure_stats()
             if set_status:
-                set_status("调参中… 亮度:{:.0f} 曝光:{:.0f}µs 增益:{:.1f}dB".format(
-                    brightness, current_exp, current_gain))
+                meter_label = "主体" if stats["meter"] == "subject" else "中心"
+                set_status("调参中… {} p70:{:.0f} p99:{:.0f} 曝光:{:.0f}µs 增益:{:.1f}dB".format(
+                    meter_label, stats["p70"], stats["p99"], current_exp, current_gain))
 
-            if abs(brightness - TARGET_BRIGHTNESS) < TOLERANCE:
-                break  # Good enough
+            overexposed = stats["bright_pct"] > 0.015 or stats["p99"] >= OVEREXP_P99
+            good = (
+                not overexposed
+                and stats["p70"] >= TARGET_P70 - 12.0
+                and stats["p70"] <= TARGET_P70 + 35.0
+            )
+            if good:
+                break
 
-            ratio = TARGET_BRIGHTNESS / max(brightness, 1.0)
-            ratio = max(0.25, min(4.0, ratio))  # clamp adjustment ratio
-
-            # Prefer adjusting exposure first, then gain
-            new_exp = current_exp * ratio
-            if new_exp < EXP_MIN:
-                new_exp = EXP_MIN
-                shortfall = TARGET_BRIGHTNESS / max(self._brightness_at(new_exp, current_gain, brightness, current_exp), 1.0)
-                new_gain = current_gain + 3.0 * max(0, shortfall - 1.0)
-                new_gain = min(GAIN_MAX, new_gain)
-            elif new_exp > EXP_MAX:
-                new_exp = EXP_MAX
-                shortfall = TARGET_BRIGHTNESS / max(self._brightness_at(new_exp, current_gain, brightness, current_exp), 1.0)
-                new_gain = current_gain + 3.0 * max(0, shortfall - 1.0)
-                new_gain = min(GAIN_MAX, new_gain)
+            if overexposed:
+                ratio = TARGET_P70 / max(stats["p70"], 10.0) * 0.90
+                ratio = max(0.45, min(0.90, ratio))
             else:
-                new_gain = current_gain  # exposure alone is enough
+                ratio = TARGET_P70 / max(stats["p70"], 12.0)
+                ratio = max(1.0, min(1.55, ratio))
 
-            # If overexposed and exposure is already short, reduce gain
-            if brightness > TARGET_BRIGHTNESS + TOLERANCE and current_exp <= EXP_MIN * 2:
-                new_gain = max(GAIN_MIN, current_gain - 2.0)
+            new_exp = max(EXP_MIN, min(AF_EXP_CAP, current_exp * ratio))
+            new_gain = current_gain
+            if overexposed and current_gain > GAIN_MIN:
+                new_gain = max(GAIN_MIN, current_gain - 1.0)
+                new_exp = current_exp
+            elif new_exp >= AF_EXP_CAP * 0.99 and stats["p70"] < TARGET_P70 - 12.0:
+                new_gain = min(GAIN_MAX, current_gain + 1.0)
 
             try:
                 self.device_controller.set_exposure(new_exp)
@@ -478,15 +713,21 @@ class MainWindow(QMainWindow):
         self._af_update_param_ui()
 
     def _af_quick_expose(self):
-        """Quick single-step exposure adjustment during focus scan."""
-        TARGET = 120.0
-        TOL = 30.0
-        EXP_MIN, EXP_MAX = 1000.0, 200000.0
-        GAIN_MIN, GAIN_MAX = 0.0, 15.0
+        """精扫阶段的单步曝光微调，逻辑与 _af_auto_expose 一致。"""
+        TARGET_P70 = 125.0
+        OVEREXP_P99 = 245.0
+        AF_EXP_CAP = 80000.0
+        EXP_MIN, EXP_MAX = 10.0, 1000000.0
+        GAIN_MIN, GAIN_MAX = 0.0, 10.0
 
-        brightness = self._get_image_brightness()
-        if abs(brightness - TARGET) < TOL:
-            return  # no adjustment needed
+        stats = self._get_exposure_stats()
+        # 已在合理范围则跳过
+        if (
+            stats["bright_pct"] <= 0.015
+            and stats["p99"] < OVEREXP_P99
+            and TARGET_P70 - 12.0 <= stats["p70"] <= TARGET_P70 + 35.0
+        ):
+            return
 
         try:
             params = self.device_controller.get_parameters()
@@ -495,15 +736,21 @@ class MainWindow(QMainWindow):
         except Exception:
             return
 
-        ratio = TARGET / max(brightness, 1.0)
-        ratio = max(0.5, min(2.0, ratio))  # gentle single-step adjustment
+        overexposed = stats["bright_pct"] > 0.015 or stats["p99"] >= OVEREXP_P99
+        if overexposed:
+            ratio = TARGET_P70 / max(stats["p70"], 10.0) * 0.90
+            ratio = max(0.50, min(0.90, ratio))
+        else:
+            ratio = TARGET_P70 / max(stats["p70"], 12.0)
+            ratio = max(1.0, min(1.5, ratio))
 
-        new_exp = max(EXP_MIN, min(EXP_MAX, cur_exp * ratio))
+        new_exp = max(EXP_MIN, min(AF_EXP_CAP, cur_exp * ratio))
         new_gain = cur_gain
-        if new_exp >= EXP_MAX and brightness < TARGET - TOL:
-            new_gain = min(GAIN_MAX, cur_gain + 1.5)
-        elif new_exp <= EXP_MIN and brightness > TARGET + TOL:
-            new_gain = max(GAIN_MIN, cur_gain - 1.5)
+        if overexposed and cur_gain > GAIN_MIN:
+            new_gain = max(GAIN_MIN, cur_gain - 0.8)
+            new_exp = cur_exp
+        elif new_exp >= AF_EXP_CAP * 0.99 and stats["p70"] < TARGET_P70 - 12.0:
+            new_gain = min(GAIN_MAX, cur_gain + 0.8)
 
         try:
             self.device_controller.set_exposure(new_exp)
@@ -538,12 +785,77 @@ class MainWindow(QMainWindow):
             return True
         try:
             self.device_controller.move_z_relative_wait(step_mm, feed=2000)
-            time.sleep(0.1)  # vibration settle
+            time.sleep(max(0.035, min(0.10, abs(step_mm) * 0.14)))
             return True
         except Exception:
             return False
 
+    @staticmethod
+    def _af_quadratic_peak(positions, scores, best_idx):
+        if best_idx <= 0 or best_idx >= len(scores) - 1:
+            return positions[best_idx]
+        y0 = float(scores[best_idx - 1])
+        y1 = float(scores[best_idx])
+        y2 = float(scores[best_idx + 1])
+        denom = y0 - 2.0 * y1 + y2
+        if abs(denom) < 1e-9:
+            return positions[best_idx]
+        step = float(positions[best_idx + 1] - positions[best_idx])
+        offset = 0.5 * (y0 - y2) / denom * step
+        offset = max(-abs(step), min(abs(step), offset))
+        return float(positions[best_idx] + offset)
+
+    @staticmethod
+    def _af_pick_best_index(scores):
+        import numpy as np
+
+        arr = np.asarray(scores, dtype=np.float32)
+        if arr.size == 0:
+            return 0
+        best_idx = int(arr.argmax())
+        if arr.size < 3 or best_idx not in (0, arr.size - 1):
+            return best_idx
+
+        local_maxima = [
+            idx for idx in range(1, arr.size - 1)
+            if arr[idx] >= arr[idx - 1] and arr[idx] >= arr[idx + 1]
+        ]
+        if not local_maxima:
+            return best_idx
+
+        best_local_idx = max(local_maxima, key=lambda idx: float(arr[idx]))
+        if float(arr[best_local_idx]) >= float(arr[best_idx]) * 0.96:
+            return int(best_local_idx)
+        return best_idx
+
+    def _af_scan_window(self, start_pos, end_pos, step, label, accumulated, set_status, sample_count=1):
+        import numpy as np
+
+        if not self._af_move_z(start_pos - accumulated):
+            return None, None, accumulated
+        accumulated = start_pos
+
+        count = int(round((end_pos - start_pos) / step)) + 1
+        positions = []
+        scores = []
+        for i in range(count):
+            if not self.autofocus_running:
+                set_status("已停止")
+                return None, None, accumulated
+            score = self._compute_sharpness(sample_count=sample_count)
+            positions.append(accumulated)
+            scores.append(score)
+            set_status("{} {}/{}  Z{:+.3f}  锐度:{:.0f}".format(label, i + 1, count, accumulated, score))
+            if i < count - 1:
+                if not self._af_move_z(step):
+                    return None, None, accumulated
+                accumulated += step
+
+        return np.asarray(positions, dtype=np.float32), np.asarray(scores, dtype=np.float32), accumulated
+
     def _autofocus_worker(self):
+        import numpy as np
+
         def set_status(message):
             QTimer.singleShot(0, lambda m=message: self.ui.lblAutoFocusStatus.setText(m))
 
@@ -554,75 +866,75 @@ class MainWindow(QMainWindow):
             if not self.autofocus_running:
                 set_status("已停止"); return
 
-            # ── Phase 1: Coarse sweep ±2mm, step 0.4mm (11 points) ──
-            set_status("对焦中… 粗扫描")
-            coarse_step = 0.4
-            coarse_range = 2.0
-            coarse_count = int(2 * coarse_range / coarse_step) + 1  # 11
+            # Phase 1a: 窄范围快速粗扫 ±0.8mm / 0.2mm 步 → 9 个位置
+            # 样品通常已接近焦点，大多数情况这一阶段即可定位
+            accumulated = 0.0
+            coarse_step = 0.20
+            coarse_positions, coarse_scores, accumulated = self._af_scan_window(
+                -1.0, 1.0, coarse_step, "对焦中… 粗扫", accumulated, set_status, sample_count=1
+            )
+            if coarse_scores is None:
+                return
+            best_idx = self._af_pick_best_index(coarse_scores)
+            coarse_peak = self._af_quadratic_peak(coarse_positions, coarse_scores, best_idx)
 
-            # Move to start position
-            if not self._af_move_z(-coarse_range):
+            # Phase 1b: 峰值在边界 → 向外以 0.4mm 步扩展到 ±2mm
+            if best_idx in (0, len(coarse_scores) - 1) and self.autofocus_running:
+                direction = -1.0 if best_idx == 0 else 1.0
+                ext_start = float(coarse_positions[best_idx] + direction * 0.4)
+                ext_end = float(coarse_positions[best_idx] + direction * 2.2)
+                ext_positions, ext_scores, accumulated = self._af_scan_window(
+                    ext_start, ext_end, 0.4 * direction, "对焦中… 扩展粗扫", accumulated, set_status, sample_count=1
+                )
+                if ext_scores is not None and len(ext_scores) > 0:
+                    all_positions = np.concatenate([coarse_positions, ext_positions])
+                    all_scores = np.concatenate([coarse_scores, ext_scores])
+                    order = np.argsort(all_positions)
+                    all_positions = all_positions[order]
+                    all_scores = all_scores[order]
+                    best_idx = self._af_pick_best_index(all_scores)
+                    coarse_peak = self._af_quadratic_peak(all_positions, all_scores, best_idx)
+
+            if not self._af_move_z(coarse_peak - accumulated):
                 set_status("对焦失败：串口错误")
                 return
-            accumulated = -coarse_range
+            accumulated = coarse_peak
+            self._af_quick_expose()
 
-            scores_c = []
-            positions_c = []
-            for i in range(coarse_count):
-                if not self.autofocus_running:
-                    set_status("已停止"); return
-                self._af_quick_expose()
-                score = self._compute_sharpness()
-                scores_c.append(score)
-                positions_c.append(accumulated)
-                set_status("对焦中… 粗扫描 {}/{} 锐度:{:.0f}".format(i + 1, coarse_count, score))
-                if i < coarse_count - 1:
-                    self._af_move_z(coarse_step)
-                    accumulated += coarse_step
+            # Phase 2: 精扫 ±0.25mm / 0.025mm 步 → 21 个位置 + 二次拟合
+            # 粗扫步长 0.2mm，最大误差 ±0.1mm，精扫范围 ±0.25mm 足够覆盖
+            fine_range = 0.22
+            fine_step = 0.030
+            fine_positions, fine_scores, accumulated = self._af_scan_window(
+                coarse_peak - fine_range,
+                coarse_peak + fine_range,
+                fine_step,
+                "对焦中… 精扫",
+                accumulated,
+                set_status,
+                sample_count=1,
+            )
+            if fine_scores is None:
+                return
+            best_idx_f = self._af_pick_best_index(fine_scores)
+            best_fine_pos = self._af_quadratic_peak(fine_positions, fine_scores, best_idx_f)
+            best_measured_pos = float(fine_positions[best_idx_f])
+            best_measured_score = float(fine_scores[best_idx_f])
 
-            # Find coarse peak
-            best_idx = max(range(len(scores_c)), key=lambda k: scores_c[k])
-            best_coarse_pos = positions_c[best_idx]
-
-            # Move to coarse peak
-            self._af_move_z(best_coarse_pos - accumulated)
-            accumulated = best_coarse_pos
-
-            # ── Phase 2: Fine sweep ±0.4mm around peak, step 0.04mm (21 points) ──
-            set_status("对焦中… 精细扫描")
-            fine_step = 0.04
-            fine_range = 0.4
-            fine_count = int(2 * fine_range / fine_step) + 1  # 21
-
-            self._af_move_z(-fine_range)
-            accumulated -= fine_range
-
-            scores_f = []
-            positions_f = []
-            for i in range(fine_count):
-                if not self.autofocus_running:
-                    set_status("已停止"); return
-                self._af_quick_expose()
-                score = self._compute_sharpness()
-                scores_f.append(score)
-                positions_f.append(accumulated)
-                set_status("对焦中… 精细扫描 {}/{} 锐度:{:.0f}".format(i + 1, fine_count, score))
-                if i < fine_count - 1:
-                    self._af_move_z(fine_step)
-                    accumulated += fine_step
-
-            # Find fine peak
-            best_idx_f = max(range(len(scores_f)), key=lambda k: scores_f[k])
-            best_fine_pos = positions_f[best_idx_f]
-
-            # Move to final best position
-            self._af_move_z(best_fine_pos - accumulated)
+            if not self._af_move_z(best_fine_pos - accumulated):
+                set_status("对焦失败：串口错误")
+                return
 
             if not self.autofocus_running:
                 set_status("已停止")
                 return
-            final_score = self._compute_sharpness()
-            set_status("对焦完成 ✓  锐度:{:.0f}".format(final_score))
+            # 最终确认：实测分数明显低于精扫最优时回退到实测峰位
+            final_score = self._compute_sharpness(sample_count=2, roi_fraction=0.72)
+            if final_score < best_measured_score * 0.88:
+                if self._af_move_z(best_measured_pos - best_fine_pos):
+                    best_fine_pos = best_measured_pos
+                    final_score = self._compute_sharpness(sample_count=2, roi_fraction=0.72)
+            set_status("对焦完成 ✓  位置偏移:{:+.3f}mm  锐度:{:.0f}".format(best_fine_pos, final_score))
         except Exception as exc:
             set_status("对焦失败: " + str(exc))
         finally:
@@ -631,6 +943,7 @@ class MainWindow(QMainWindow):
             def _af_cleanup():
                 self.ui.bnAutoFocus.setEnabled(True)
                 self.ui.bnStopAutoFocus.setEnabled(False)
+                self._update_z_display()
                 if stopped_by_user:
                     self.ui.lblAutoFocusStatus.setText("已停止")
             QTimer.singleShot(0, _af_cleanup)
@@ -647,81 +960,15 @@ class MainWindow(QMainWindow):
         self.ui.bnStopAutoFocus.setEnabled(True)
         threading.Thread(target=self._autofocus_worker, daemon=True).start()
 
+    def start_autofocus_worker_only(self):
+        """供可编程拍摄调用：直接启动对焦线程，不做 UI 弹窗检查。"""
+        threading.Thread(target=self._autofocus_worker, daemon=True).start()
+
     def stop_autofocus(self):
         self.autofocus_running = False
         self.ui.bnAutoFocus.setEnabled(True)
         self.ui.bnStopAutoFocus.setEnabled(False)
         self.ui.lblAutoFocusStatus.setText("已停止")
-
-    def _auto_calib_worker(self, move_mm, axis):
-        def set_status(message):
-            QTimer.singleShot(0, lambda m=message: self.ui.lblAutoCalibStatus.setText(m))
-
-        try:
-            set_status("标定中… 采集初始帧")
-            frame1, width, height = self.device_controller.get_gray_frame()
-            if frame1 is None or width == 0 or height == 0:
-                set_status("标定失败：无法获取初始帧")
-                return
-
-            set_status("标定中… 移动 {:.3f}mm ({})轴".format(move_mm, axis))
-            self.send_gcode("G1 {}{:.4f} F300\n".format(axis, move_mm))
-            time.sleep(max(0.5, abs(move_mm) / 10.0 + 0.4))
-
-            set_status("标定中… 采集移动后帧")
-            frame2, width2, height2 = self.device_controller.get_gray_frame()
-            if frame2 is None or width2 == 0 or height2 == 0:
-                set_status("标定失败：无法获取移动后帧")
-                return
-
-            dx, dy = phase_correlation_shift(frame1, frame2)
-            shift_px = abs(dx) if axis.upper() == "X" else abs(dy)
-            if shift_px < 1.0:
-                set_status("标定失败：位移过小({:.2f}px)".format(shift_px))
-                return
-
-            ppmm = shift_px / abs(move_mm)
-
-            def update_ui():
-                self.config_manager.pixels_per_mm = ppmm
-                self.ui.edtPixelsPerMm.setText("{:.4f}".format(ppmm))
-                self.apply_scale_calib()
-                self.ui.lblAutoCalibStatus.setText(
-                    "标定完成 ✓\n{:.2f} px/mm | {:.3f} µm/px".format(ppmm, 1000.0 / ppmm)
-                )
-
-            QTimer.singleShot(0, update_ui)
-        except Exception as exc:
-            set_status("标定失败: " + str(exc))
-        finally:
-            self.auto_calib_running = False
-            QTimer.singleShot(0, lambda: self.ui.bnAutoCalib.setEnabled(True))
-
-    def start_auto_calib(self):
-        if not self.device_controller.grabbing:
-            QMessageBox.warning(self, "错误", "请先开始采集！", QMessageBox.Ok)
-            return
-        if not self.device_controller.serial_connected:
-            QMessageBox.warning(self, "错误", "请先连接串口！", QMessageBox.Ok)
-            return
-        if self.auto_calib_running:
-            QMessageBox.warning(self, "提示", "标定正在进行中！", QMessageBox.Ok)
-            return
-        try:
-            move_mm = float(self.ui.edtCalibMoveMm.text().strip())
-            if abs(move_mm) < 0.01:
-                raise ValueError
-        except ValueError:
-            QMessageBox.warning(self, "输入错误", "请输入有效的移动距离（mm），最小 0.01mm。", QMessageBox.Ok)
-            return
-
-        axis, ok = QInputDialog.getItem(self, "选择标定轴", "请选择移动轴：", ["X", "Y"], 0, False)
-        if not ok:
-            return
-        self.auto_calib_running = True
-        self.ui.bnAutoCalib.setEnabled(False)
-        self.ui.lblAutoCalibStatus.setText("标定中…")
-        threading.Thread(target=self._auto_calib_worker, args=(move_mm, axis), daemon=True).start()
 
     def capture_dark_frame(self):
         if not self.device_controller.grabbing:
@@ -733,7 +980,9 @@ class MainWindow(QMainWindow):
             self.ui.chkDarkSub.setEnabled(True)
             self.ui.bnClearDark.setEnabled(True)
             self.ui.lblDarkSubStatus.setText(
-                "帧大小: {}x{}\n均值: {:.1f}\n底噪帧已就绪".format(info["width"], info["height"], info["mean"])
+                "帧大小: {}x{}\n采样: {}帧\n均值: {:.1f}\n底噪帧已就绪".format(
+                    info["width"], info["height"], info.get("frames", 1), info["mean"]
+                )
             )
         except Exception as exc:
             QMessageBox.warning(self, "错误", "采集底噪帧失败:\n" + str(exc), QMessageBox.Ok)
@@ -760,25 +1009,39 @@ class MainWindow(QMainWindow):
         self.ui.lblDarkSubStatus.setText("未采集")
 
     def open_recon3d_dialog(self):
+        self._sync_z_from_device(show_error=False)
         if self._recon3d_dialog is None:
             self._recon3d_dialog = PointCloudReconDialog(self.device_controller, self.config_manager, self)
+        self._recon3d_dialog.sync_z_inputs_to_current()
         self._recon3d_dialog.show()
         self._recon3d_dialog.raise_()
         self._recon3d_dialog.activateWindow()
 
     def open_temporal_depth_dialog(self):
+        self._sync_z_from_device(show_error=False)
         if self._temporal_depth_dialog is None:
             self._temporal_depth_dialog = TemporalDepthDialog(self.device_controller, self.config_manager, self)
+        self._temporal_depth_dialog.sync_z_inputs_to_current()
         self._temporal_depth_dialog.show()
         self._temporal_depth_dialog.raise_()
         self._temporal_depth_dialog.activateWindow()
 
     def open_one_click_dialog(self):
+        self._sync_z_from_device(show_error=False)
         if self._one_click_dialog is None:
             self._one_click_dialog = OneClickDialog(self.device_controller, self.config_manager, self)
+        self._one_click_dialog.sync_z_inputs_to_current()
         self._one_click_dialog.show()
         self._one_click_dialog.raise_()
         self._one_click_dialog.activateWindow()
+
+    def open_programmable_shooting_dialog(self):
+        if self._programmable_dialog is None:
+            self._programmable_dialog = ProgrammableShootingDialog(
+                self.device_controller, self.config_manager, self, self)
+        self._programmable_dialog.show()
+        self._programmable_dialog.raise_()
+        self._programmable_dialog.activateWindow()
 
     def enable_controls(self):
         is_open = self.device_controller.opened
@@ -790,11 +1053,11 @@ class MainWindow(QMainWindow):
         self.ui.bnClose.setEnabled(is_open)
         self.ui.bnStart.setEnabled(is_open and not is_grabbing)
         self.ui.bnStop.setEnabled(is_open and is_grabbing)
-        self.ui.bnAutoCapture.setEnabled(is_open and is_grabbing)
         self.ui.bnAutoFocus.setEnabled(is_open and is_grabbing and not self.autofocus_running)
         self.ui.bnStopAutoFocus.setEnabled(self.autofocus_running)
-        self.ui.bnAutoCalib.setEnabled(is_open and is_grabbing and not self.auto_calib_running)
+        self.ui.bnQuickScale.setEnabled(is_open and is_grabbing and not self.quick_scale_running)
         self.ui.bnCaptureDark.setEnabled(is_open and is_grabbing)
+        self._update_z_motion_buttons()
         if not (is_open and is_grabbing):
             self.device_controller.set_dark_sub_enabled(False)
             self.ui.chkDarkSub.setChecked(False)
@@ -811,6 +1074,11 @@ class MainWindow(QMainWindow):
         if self._cleaned_up:
             return
         self._cleaned_up = True
+        try:
+            self.scale_overlay.hide()
+            self.scale_overlay.close()
+        except Exception:
+            pass
         try:
             self.device_controller.cleanup()
         except Exception:

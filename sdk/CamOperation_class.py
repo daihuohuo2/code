@@ -108,8 +108,9 @@ class CameraOperation:
         self.exposure_time = exposure_time
         self.gain = gain
         self.buf_lock = threading.Lock()  # 取图和存图的buffer锁
-        self.dark_frame = None        # 底噪帧（numpy int16 一维数组，与图像相同长度）
+        self.dark_frame = None        # 底噪模板（解码后的逐像素 numpy 数组）
         self.apply_dark_sub = False   # 是否启用底噪扣除
+        self._last_log_time = 0.0
 
     # 打开相机
     def Open_device(self):
@@ -165,8 +166,8 @@ class CameraOperation:
             self.b_start_grabbing = True
             print("start grabbing successfully!")
             try:
-                thread_id = random.randint(1, 10000)
                 self.h_thread_handle = threading.Thread(target=CameraOperation.Work_thread, args=(self, winHandle))
+                self.h_thread_handle.daemon = True
                 self.h_thread_handle.start()
                 self.b_thread_closed = True
             finally:
@@ -178,16 +179,15 @@ class CameraOperation:
     # 停止取图
     def Stop_grabbing(self):
         if self.b_start_grabbing and self.b_open_device:
-            # 退出线程
-            if self.b_thread_closed:
-                Stop_thread(self.h_thread_handle)
-                self.b_thread_closed = False
+            self.b_exit = True
             ret = self.obj_cam.MV_CC_StopGrabbing()
             if ret != 0:
                 return ret
+            if self.b_thread_closed and self.h_thread_handle is not None:
+                self.h_thread_handle.join(timeout=1.5)
             print("stop grabbing successfully!")
             self.b_start_grabbing = False
-            self.b_exit = True
+            self.b_thread_closed = False
             return MV_OK
         else:
             return MV_E_CALLORDER
@@ -195,9 +195,14 @@ class CameraOperation:
     # 关闭相机
     def Close_device(self):
         if self.b_open_device:
-            # 退出线程
-            if self.b_thread_closed:
-                Stop_thread(self.h_thread_handle)
+            self.b_exit = True
+            if self.b_start_grabbing:
+                ret = self.obj_cam.MV_CC_StopGrabbing()
+                if ret != 0:
+                    return ret
+                self.b_start_grabbing = False
+            if self.b_thread_closed and self.h_thread_handle is not None:
+                self.h_thread_handle.join(timeout=1.5)
                 self.b_thread_closed = False
             ret = self.obj_cam.MV_CC_CloseDevice()
             if ret != 0:
@@ -275,6 +280,10 @@ class CameraOperation:
                 print('show error', 'set exposure time fail! ret = ' + To_hex_str(ret))
                 return ret
 
+            try:
+                self.obj_cam.MV_CC_SetEnumValue("GainAuto", 0)
+            except Exception:
+                pass
             ret = self.obj_cam.MV_CC_SetFloatValue("Gain", float(gain))
             if ret != 0:
                 print('show error', 'set gain fail! ret = ' + To_hex_str(ret))
@@ -294,66 +303,59 @@ class CameraOperation:
         stOutFrame = MV_FRAME_OUT()
         memset(byref(stOutFrame), 0, sizeof(stOutFrame))
 
-        while True:
+        while not self.b_exit:
             ret = self.obj_cam.MV_CC_GetImageBuffer(stOutFrame, 1000)
             if 0 == ret:
 
                 # 拷贝图像和图像信息
                 # 获取缓存锁
                 self.buf_lock.acquire()
-                if self.buf_save_image_len < stOutFrame.stFrameInfo.nFrameLen:
-                    if self.buf_save_image is not None:
-                        del self.buf_save_image
-                        self.buf_save_image = None
-                    self.buf_save_image = (c_ubyte * stOutFrame.stFrameInfo.nFrameLen)()
-                    self.buf_save_image_len = stOutFrame.stFrameInfo.nFrameLen
+                try:
+                    if self.buf_save_image_len < stOutFrame.stFrameInfo.nFrameLen:
+                        if self.buf_save_image is not None:
+                            del self.buf_save_image
+                            self.buf_save_image = None
+                        self.buf_save_image = (c_ubyte * stOutFrame.stFrameInfo.nFrameLen)()
+                        self.buf_save_image_len = stOutFrame.stFrameInfo.nFrameLen
 
-                memmove(byref(self.st_frame_info), byref(stOutFrame.stFrameInfo), sizeof(MV_FRAME_OUT_INFO_EX))
-                memmove(byref(self.buf_save_image), stOutFrame.pBufAddr, self.st_frame_info.nFrameLen)
-                self.buf_lock.release()
+                    memmove(byref(self.st_frame_info), byref(stOutFrame.stFrameInfo), sizeof(MV_FRAME_OUT_INFO_EX))
+                    memmove(byref(self.buf_save_image), stOutFrame.pBufAddr, self.st_frame_info.nFrameLen)
 
-                print("get one frame: Width[%d], Height[%d], nFrameNum[%d]"
-                      % (self.st_frame_info.nWidth, self.st_frame_info.nHeight, self.st_frame_info.nFrameNum))
+                    if self.apply_dark_sub and self.dark_frame is not None:
+                        try:
+                            self._apply_dark_sub_locked()
+                        except Exception as _e:
+                            print("[DarkSub] error:", _e)
+                finally:
+                    self.buf_lock.release()
 
-                # ── 底噪扣除 ──────────────────────────────────────────
-                if self.apply_dark_sub and self.dark_frame is not None:
-                    try:
-                        import numpy as np
-                        frame_len = self.st_frame_info.nFrameLen
-                        if len(self.dark_frame) == frame_len:
-                            raw = np.frombuffer(self.buf_save_image,
-                                                dtype=np.uint8, count=frame_len)
-                            result = np.clip(
-                                raw.astype(np.int16) - self.dark_frame,
-                                0, 255).astype(np.uint8)
-                            ctypes.memmove(self.buf_save_image,
-                                           result.ctypes.data, frame_len)
-                    except Exception as _e:
-                        print("[DarkSub] error:", _e)
-                # ────────────────────────────────────────────────────
+                now = time.time()
+                if now - self._last_log_time >= 1.0:
+                    self._last_log_time = now
+                    print("preview frame: Width[%d], Height[%d], nFrameNum[%d]"
+                          % (self.st_frame_info.nWidth, self.st_frame_info.nHeight, self.st_frame_info.nFrameNum))
 
                 # 释放缓存
                 self.obj_cam.MV_CC_FreeImageBuffer(stOutFrame)
             else:
-                print("no data, ret = " + To_hex_str(ret))
+                if not self.b_exit:
+                    print("no data, ret = " + To_hex_str(ret))
                 continue
 
             # 使用Display接口显示图像
             stDisplayParam = MV_DISPLAY_FRAME_INFO()
             memset(byref(stDisplayParam), 0, sizeof(stDisplayParam))
-            stDisplayParam.hWnd = int(winHandle)
-            stDisplayParam.nWidth = self.st_frame_info.nWidth
-            stDisplayParam.nHeight = self.st_frame_info.nHeight
-            stDisplayParam.enPixelType = self.st_frame_info.enPixelType
-            stDisplayParam.pData = self.buf_save_image
-            stDisplayParam.nDataLen = self.st_frame_info.nFrameLen
-            self.obj_cam.MV_CC_DisplayOneFrame(stDisplayParam)
-
-            # 是否退出
-            if self.b_exit:
-                if self.buf_save_image is not None:
-                    del self.buf_save_image
-                break
+            self.buf_lock.acquire()
+            try:
+                stDisplayParam.hWnd = int(winHandle)
+                stDisplayParam.nWidth = self.st_frame_info.nWidth
+                stDisplayParam.nHeight = self.st_frame_info.nHeight
+                stDisplayParam.enPixelType = self.st_frame_info.enPixelType
+                stDisplayParam.pData = self.buf_save_image
+                stDisplayParam.nDataLen = self.st_frame_info.nFrameLen
+                self.obj_cam.MV_CC_DisplayOneFrame(stDisplayParam)
+            finally:
+                self.buf_lock.release()
 
     # 存jpg图像
     def Save_jpg(self):
@@ -409,11 +411,62 @@ class CameraOperation:
         return ret
 
     # 获取当前帧的 numpy 数组副本（用于锐度计算）
+    def _apply_dark_sub_locked(self):
+        import numpy as np
+
+        if self.dark_frame is None or self.buf_save_image is None:
+            return
+        w = int(self.st_frame_info.nWidth)
+        h = int(self.st_frame_info.nHeight)
+        pixel_count = w * h
+        if pixel_count <= 0 or len(self.dark_frame) < pixel_count:
+            return
+
+        pixel_type = self.st_frame_info.enPixelType
+        dark = np.asarray(self.dark_frame[:pixel_count], dtype=np.int32)
+
+        if pixel_type == PixelType_Gvsp_Mono8:
+            raw = np.frombuffer(self.buf_save_image, dtype=np.uint8, count=pixel_count)
+            raw[:] = np.clip(raw.astype(np.int32) - dark, 0, 255).astype(np.uint8)
+            return
+
+        if pixel_type in (PixelType_Gvsp_Mono10, PixelType_Gvsp_Mono12):
+            raw = np.frombuffer(self.buf_save_image, dtype=np.uint16, count=pixel_count)
+            max_value = 1023 if pixel_type == PixelType_Gvsp_Mono10 else 4095
+            raw[:] = np.clip(raw.astype(np.int32) - dark, 0, max_value).astype(np.uint16)
+            return
+
+        if pixel_type == PixelType_Gvsp_Mono12_Packed:
+            frame_len = int(self.st_frame_info.nFrameLen)
+            raw = np.frombuffer(self.buf_save_image, dtype=np.uint8, count=frame_len)
+            packed = raw[: (pixel_count * 3 + 1) // 2]
+            groups = packed[: (len(packed) // 3) * 3].reshape(-1, 3).astype(np.uint16)
+            out = np.empty(groups.shape[0] * 2, dtype=np.uint16)
+            out[0::2] = groups[:, 0] | ((groups[:, 1] & 0x0F) << 8)
+            out[1::2] = (groups[:, 1] >> 4) | (groups[:, 2] << 4)
+            if len(out) < pixel_count and len(packed) % 3 == 2:
+                tail = np.array([packed[-2] | ((packed[-1] & 0x0F) << 8)], dtype=np.uint16)
+                out = np.concatenate([out, tail])
+            corrected = np.clip(out[:pixel_count].astype(np.int32) - dark, 0, 4095).astype(np.uint16)
+
+            full_pairs = pixel_count // 2
+            if full_pairs:
+                even = corrected[: full_pairs * 2:2]
+                odd = corrected[1: full_pairs * 2:2]
+                packed_groups = packed[: full_pairs * 3].reshape(-1, 3)
+                packed_groups[:, 0] = (even & 0xFF).astype(np.uint8)
+                packed_groups[:, 1] = (((even >> 8) & 0x0F) | ((odd & 0x0F) << 4)).astype(np.uint8)
+                packed_groups[:, 2] = ((odd >> 4) & 0xFF).astype(np.uint8)
+            if pixel_count % 2 and len(packed) >= full_pairs * 3 + 2:
+                last = corrected[-1]
+                packed[full_pairs * 3] = int(last & 0xFF)
+                packed[full_pairs * 3 + 1] = int((last >> 8) & 0x0F)
+
     def Get_frame_numpy(self):
         """
-        返回当前帧的 numpy uint8 一维数组副本及宽高。
+        返回当前帧的 numpy 一维数组副本及宽高。
         返回值: (data: ndarray | None, width: int, height: int)
-        对于 Mono8/BayerXX8 图像，data 长度 = width * height。
+        Mono8 返回 uint8，Mono10/Mono12 返回 uint16，data 长度 = width * height。
         """
         if self.buf_save_image is None or self.buf_save_image_len == 0:
             return None, 0, 0
@@ -423,12 +476,155 @@ class CameraOperation:
             w = self.st_frame_info.nWidth
             h = self.st_frame_info.nHeight
             frame_len = self.st_frame_info.nFrameLen
+            pixel_type = self.st_frame_info.enPixelType
             # 将 ctypes 缓冲复制到 numpy 数组
             raw = (c_ubyte * frame_len).from_buffer_copy(self.buf_save_image)
-            data = np.frombuffer(raw, dtype=np.uint8).copy()
+            byte_data = np.frombuffer(raw, dtype=np.uint8).copy()
+            pixel_count = int(w * h)
+
+            unpacked_10_12 = (
+                PixelType_Gvsp_Mono10,
+                PixelType_Gvsp_Mono12,
+                PixelType_Gvsp_BayerGR10,
+                PixelType_Gvsp_BayerRG10,
+                PixelType_Gvsp_BayerGB10,
+                PixelType_Gvsp_BayerBG10,
+                PixelType_Gvsp_BayerGR12,
+                PixelType_Gvsp_BayerRG12,
+                PixelType_Gvsp_BayerGB12,
+                PixelType_Gvsp_BayerBG12,
+            )
+            if pixel_type in unpacked_10_12:
+                count = min(pixel_count, len(byte_data) // 2)
+                data = np.frombuffer(byte_data.tobytes(), dtype="<u2", count=count).copy()
+                if pixel_type in (
+                    PixelType_Gvsp_Mono10,
+                    PixelType_Gvsp_BayerGR10,
+                    PixelType_Gvsp_BayerRG10,
+                    PixelType_Gvsp_BayerGB10,
+                    PixelType_Gvsp_BayerBG10,
+                ):
+                    data = np.bitwise_and(data, 0x03FF).astype(np.uint16, copy=False)
+                else:
+                    data = np.bitwise_and(data, 0x0FFF).astype(np.uint16, copy=False)
+                return data, w, h
+
+            if pixel_type == PixelType_Gvsp_BayerGR16 or pixel_type == PixelType_Gvsp_BayerRG16 \
+                    or pixel_type == PixelType_Gvsp_BayerGB16 or pixel_type == PixelType_Gvsp_BayerBG16:
+                count = min(pixel_count, len(byte_data) // 2)
+                data = np.frombuffer(byte_data.tobytes(), dtype="<u2", count=count).copy()
+                return data, w, h
+
+            packed_12 = (
+                PixelType_Gvsp_Mono12_Packed,
+                PixelType_Gvsp_BayerGR12_Packed,
+                PixelType_Gvsp_BayerRG12_Packed,
+                PixelType_Gvsp_BayerGB12_Packed,
+                PixelType_Gvsp_BayerBG12_Packed,
+            )
+            if pixel_type in packed_12 and len(byte_data) >= (pixel_count * 3 + 1) // 2:
+                packed = byte_data[: (pixel_count * 3 + 1) // 2]
+                groups = packed[: (len(packed) // 3) * 3].reshape(-1, 3).astype(np.uint16)
+                out = np.empty(groups.shape[0] * 2, dtype=np.uint16)
+                out[0::2] = groups[:, 0] | ((groups[:, 1] & 0x0F) << 8)
+                out[1::2] = (groups[:, 1] >> 4) | (groups[:, 2] << 4)
+                if len(out) < pixel_count and len(packed) % 3 == 2:
+                    tail = np.array([packed[-2] | ((packed[-1] & 0x0F) << 8)], dtype=np.uint16)
+                    out = np.concatenate([out, tail])
+                data = out[:pixel_count].copy()
+                return data, w, h
+
+            data = byte_data[:pixel_count].copy()
             return data, w, h
         except Exception as e:
             print("[Get_frame_numpy] error:", e)
+            return None, 0, 0
+        finally:
+            self.buf_lock.release()
+
+    def Get_frame_rgb_numpy(self):
+        """
+        返回当前帧的 RGB 图像副本及宽高。
+        支持 RGB/BGR8、Bayer8/10/12/16；Mono 帧返回 None，由上层退回灰度。
+        """
+        if self.buf_save_image is None or self.buf_save_image_len == 0:
+            return None, 0, 0
+        self.buf_lock.acquire()
+        try:
+            import numpy as np
+            import cv2
+
+            w = int(self.st_frame_info.nWidth)
+            h = int(self.st_frame_info.nHeight)
+            frame_len = int(self.st_frame_info.nFrameLen)
+            pixel_type = self.st_frame_info.enPixelType
+            pixel_count = w * h
+            raw = (c_ubyte * frame_len).from_buffer_copy(self.buf_save_image)
+            byte_data = np.frombuffer(raw, dtype=np.uint8).copy()
+
+            rgb8 = globals().get("PixelType_Gvsp_RGB8_Packed")
+            bgr8 = globals().get("PixelType_Gvsp_BGR8_Packed")
+            if rgb8 is not None and pixel_type == rgb8 and len(byte_data) >= pixel_count * 3:
+                return byte_data[: pixel_count * 3].reshape(h, w, 3).copy(), w, h
+            if bgr8 is not None and pixel_type == bgr8 and len(byte_data) >= pixel_count * 3:
+                bgr = byte_data[: pixel_count * 3].reshape(h, w, 3)
+                return bgr[:, :, ::-1].copy(), w, h
+
+            bayer8_codes = {
+                globals().get("PixelType_Gvsp_BayerGR8"): cv2.COLOR_BayerGR2RGB,
+                globals().get("PixelType_Gvsp_BayerRG8"): cv2.COLOR_BayerRG2RGB,
+                globals().get("PixelType_Gvsp_BayerGB8"): cv2.COLOR_BayerGB2RGB,
+                globals().get("PixelType_Gvsp_BayerBG8"): cv2.COLOR_BayerBG2RGB,
+            }
+            if pixel_type in bayer8_codes and len(byte_data) >= pixel_count:
+                mosaic = byte_data[:pixel_count].reshape(h, w)
+                rgb = cv2.cvtColor(mosaic, bayer8_codes[pixel_type])
+                return rgb[:, :, ::-1].copy(), w, h
+
+            bayer16_codes = {
+                globals().get("PixelType_Gvsp_BayerGR10"): cv2.COLOR_BayerGR2RGB,
+                globals().get("PixelType_Gvsp_BayerRG10"): cv2.COLOR_BayerRG2RGB,
+                globals().get("PixelType_Gvsp_BayerGB10"): cv2.COLOR_BayerGB2RGB,
+                globals().get("PixelType_Gvsp_BayerBG10"): cv2.COLOR_BayerBG2RGB,
+                globals().get("PixelType_Gvsp_BayerGR12"): cv2.COLOR_BayerGR2RGB,
+                globals().get("PixelType_Gvsp_BayerRG12"): cv2.COLOR_BayerRG2RGB,
+                globals().get("PixelType_Gvsp_BayerGB12"): cv2.COLOR_BayerGB2RGB,
+                globals().get("PixelType_Gvsp_BayerBG12"): cv2.COLOR_BayerBG2RGB,
+                globals().get("PixelType_Gvsp_BayerGR16"): cv2.COLOR_BayerGR2RGB,
+                globals().get("PixelType_Gvsp_BayerRG16"): cv2.COLOR_BayerRG2RGB,
+                globals().get("PixelType_Gvsp_BayerGB16"): cv2.COLOR_BayerGB2RGB,
+                globals().get("PixelType_Gvsp_BayerBG16"): cv2.COLOR_BayerBG2RGB,
+            }
+            if pixel_type in bayer16_codes and len(byte_data) >= pixel_count * 2:
+                mosaic16 = np.frombuffer(byte_data.tobytes(), dtype="<u2", count=pixel_count).reshape(h, w)
+                rgb16 = cv2.cvtColor(mosaic16, bayer16_codes[pixel_type])
+                max_value = 4095.0 if "12" in str(pixel_type) else 65535.0
+                rgb = np.clip(rgb16.astype(np.float32) / max_value * 255.0, 0, 255).astype(np.uint8)
+                return rgb[:, :, ::-1].copy(), w, h
+
+            bayer12_packed_codes = {
+                globals().get("PixelType_Gvsp_BayerGR12_Packed"): cv2.COLOR_BayerGR2RGB,
+                globals().get("PixelType_Gvsp_BayerRG12_Packed"): cv2.COLOR_BayerRG2RGB,
+                globals().get("PixelType_Gvsp_BayerGB12_Packed"): cv2.COLOR_BayerGB2RGB,
+                globals().get("PixelType_Gvsp_BayerBG12_Packed"): cv2.COLOR_BayerBG2RGB,
+            }
+            if pixel_type in bayer12_packed_codes and len(byte_data) >= (pixel_count * 3 + 1) // 2:
+                packed = byte_data[: (pixel_count * 3 + 1) // 2]
+                groups = packed[: (len(packed) // 3) * 3].reshape(-1, 3).astype(np.uint16)
+                out = np.empty(groups.shape[0] * 2, dtype=np.uint16)
+                out[0::2] = groups[:, 0] | ((groups[:, 1] & 0x0F) << 8)
+                out[1::2] = (groups[:, 1] >> 4) | (groups[:, 2] << 4)
+                if len(out) < pixel_count and len(packed) % 3 == 2:
+                    tail = np.array([packed[-2] | ((packed[-1] & 0x0F) << 8)], dtype=np.uint16)
+                    out = np.concatenate([out, tail])
+                mosaic16 = out[:pixel_count].reshape(h, w)
+                rgb16 = cv2.cvtColor(mosaic16, bayer12_packed_codes[pixel_type])
+                rgb = np.clip(rgb16.astype(np.float32) / 4095.0 * 255.0, 0, 255).astype(np.uint8)
+                return rgb[:, :, ::-1].copy(), w, h
+
+            return None, 0, 0
+        except Exception as e:
+            print("[Get_frame_rgb_numpy] error:", e)
             return None, 0, 0
         finally:
             self.buf_lock.release()
