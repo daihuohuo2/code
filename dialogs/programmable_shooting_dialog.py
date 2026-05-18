@@ -191,6 +191,12 @@ class ProgrammableShootingDialog(QDialog):
         preview_layout = QVBoxLayout(grp_preview)
         self._lbl_task_count = QLabel("尚未加载任务")
         preview_layout.addWidget(self._lbl_task_count)
+        self._txt_preview = QPlainTextEdit()
+        self._txt_preview.setReadOnly(True)
+        self._txt_preview.setMaximumBlockCount(2000)
+        self._txt_preview.setFixedHeight(160)
+        self._txt_preview.setVisible(False)
+        preview_layout.addWidget(self._txt_preview)
         layout.addWidget(grp_preview)
 
         # ── 控制按钮 ──
@@ -266,9 +272,9 @@ class ProgrammableShootingDialog(QDialog):
                     "是" if t["auto_focus"] else "否",
                     t["shutter"], t["gain"], t["light"],
                 ))
-            self._lbl_task_count.setText(
-                "共 {} 条任务\n{}".format(len(self._tasks), "\n".join(lines))
-            )
+            self._lbl_task_count.setText("共 {} 条任务".format(len(self._tasks)))
+            self._txt_preview.setPlainText("\n".join(lines))
+            self._txt_preview.setVisible(True)
         except Exception as exc:
             self._tasks = []
             self._lbl_task_count.setText("加载失败: {}".format(exc))
