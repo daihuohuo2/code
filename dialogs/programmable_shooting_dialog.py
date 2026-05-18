@@ -122,8 +122,20 @@ def _images_to_mp4(image_dir, output_path, fps=24, image_names=None):
         raise RuntimeError("无法读取图片: {}".format(images[0]))
     h, w = first.shape[:2]
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+    # 优先使用 H.264 (avc1)，Windows 媒体播放器原生支持；
+    # 若 OpenCV 不支持则回退到 mp4v（改用 .avi 扩展名以确保可播放）。
+    h264_fourcc = cv2.VideoWriter_fourcc(*"avc1")
+    test_writer = cv2.VideoWriter(output_path, h264_fourcc, fps, (w, h))
+    if test_writer.isOpened():
+        fourcc = h264_fourcc
+        writer = test_writer
+    else:
+        test_writer.release()
+        # H.264 不可用，改用 mp4v 写入 .avi
+        base, _ = os.path.splitext(output_path)
+        output_path = base + ".avi"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
     try:
         for img_name in images:
             frame = cv2.imread(os.path.join(image_dir, img_name))
@@ -133,6 +145,7 @@ def _images_to_mp4(image_dir, output_path, fps=24, image_names=None):
                 writer.write(frame)
     finally:
         writer.release()
+    return output_path
 
 
 class ProgrammableShootingDialog(QDialog):
@@ -491,10 +504,10 @@ class ProgrammableShootingDialog(QDialog):
 
         video_path = os.path.join(self._save_dir, "output_24fps.mp4")
         try:
-            _images_to_mp4(self._save_dir, video_path, fps=24, image_names=captured_images)
-            self._sig_log.emit("视频已保存: {}".format(video_path))
+            actual_path = _images_to_mp4(self._save_dir, video_path, fps=24, image_names=captured_images)
+            self._sig_log.emit("视频已保存: {}".format(actual_path))
             self._sig_done.emit(True,
-                "全部完成！\n成功拍摄 {}/{} 张\n视频: {}".format(completed, total, video_path))
+                "全部完成！\n成功拍摄 {}/{} 张\n视频: {}".format(completed, total, actual_path))
         except ImportError:
             self._sig_log.emit("未安装 opencv-python，跳过视频合成。请执行: pip install opencv-python")
             self._sig_done.emit(True,
