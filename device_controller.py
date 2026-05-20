@@ -239,6 +239,12 @@ class DeviceController:
         if ret != 0:
             raise RuntimeError("Set gain failed ret:{}".format(to_hex_str(ret)))
 
+    def get_frame_num(self):
+        """返回相机当前帧的序号，可用于判断是否有新帧到来。"""
+        if self.obj_cam_operation is None:
+            return -1
+        return int(self.obj_cam_operation.st_frame_info.nFrameNum)
+
     def get_frame_numpy(self):
         self._ensure_camera()
         return self.obj_cam_operation.Get_frame_numpy()
