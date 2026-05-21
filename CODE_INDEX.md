@@ -163,7 +163,7 @@
 | 更新参数 UI | `L668` | `_af_update_param_ui` — 读取相机参数更新 3 个输入框 |
 | Z 轴移动（对焦内） | `L680` | `_af_move_z(step_mm)` — 相对移动并等待稳定 |
 | 三点二次拟合焦点 | `L686` | `_af_quadratic_peak` — 计算亚步长精确焦面位置 |
-| 中央 ROI 锐度评分 | `L534` | `_compute_sharpness` — Tenengrad+Laplacian 混合，屏蔽过曝区域 |
+| 中央/点击 ROI 锐度评分 | `main_window.py` | `_compute_sharpness` / `_af_atlas_score` — ATLAS Focus：有效纹理块筛选 + 多尺度 Tenengrad/Laplacian/Brenner 融合，屏蔽过曝区域 |
 | 曝光统计（Otsu 分割） | `L577` | `_get_exposure_stats` — 区分主体/背景后测光 |
 | 图像亮度读取 | `L623` | `_get_image_brightness` — 中央 ROI p50 亮度 |
 | 中央 ROI 截取 | `L520` | `_get_center_roi(roi_fraction=0.55)` |

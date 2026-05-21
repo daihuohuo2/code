@@ -467,8 +467,132 @@ class MainWindow(QMainWindow):
         self._af_roi_center = (img_cx, img_cy)
         self.start_autofocus()
 
+    @staticmethod
+    def _af_smooth3(gray):
+        import numpy as np
+
+        arr = np.asarray(gray, dtype=np.float32)
+        if arr.shape[0] < 3 or arr.shape[1] < 3:
+            return arr.copy()
+        padded = np.pad(arr, ((1, 1), (1, 1)), mode="edge")
+        return (
+            padded[:-2, :-2] + 2.0 * padded[:-2, 1:-1] + padded[:-2, 2:]
+            + 2.0 * padded[1:-1, :-2] + 4.0 * padded[1:-1, 1:-1] + 2.0 * padded[1:-1, 2:]
+            + padded[2:, :-2] + 2.0 * padded[2:, 1:-1] + padded[2:, 2:]
+        ) / 16.0
+
+    @staticmethod
+    def _af_focus_components(gray):
+        import numpy as np
+
+        arr = np.asarray(gray, dtype=np.float32)
+        gx = np.zeros_like(arr, dtype=np.float32)
+        gy = np.zeros_like(arr, dtype=np.float32)
+        gx[:, 1:-1] = arr[:, 2:] - arr[:, :-2]
+        gy[1:-1, :] = arr[2:, :] - arr[:-2, :]
+        grad2 = gx * gx + gy * gy
+
+        lap = np.zeros_like(arr, dtype=np.float32)
+        lap[1:-1, 1:-1] = (
+            arr[:-2, 1:-1]
+            + arr[2:, 1:-1]
+            + arr[1:-1, :-2]
+            + arr[1:-1, 2:]
+            - 4.0 * arr[1:-1, 1:-1]
+        )
+
+        brenner = np.zeros_like(arr, dtype=np.float32)
+        brenner[:, :-2] += (arr[:, 2:] - arr[:, :-2]) ** 2
+        brenner[:-2, :] += (arr[2:, :] - arr[:-2, :]) ** 2
+        return grad2, lap * lap, brenner
+
+    @staticmethod
+    def _af_texture_mask(roi_f, body_mask, block=16):
+        import numpy as np
+
+        h, w = roi_f.shape
+        if h < block * 2 or w < block * 2:
+            return body_mask
+
+        h2 = h // block * block
+        w2 = w // block * block
+        cropped = roi_f[:h2, :w2]
+        body = body_mask[:h2, :w2]
+        blocks = cropped.reshape(h2 // block, block, w2 // block, block)
+        body_blocks = body.reshape(h2 // block, block, w2 // block, block)
+        block_var = np.var(blocks, axis=(1, 3))
+        body_ratio = np.mean(body_blocks, axis=(1, 3))
+        usable = body_ratio >= 0.18
+        if not np.any(usable):
+            return body_mask
+
+        var_cut = float(np.percentile(block_var[usable], 55.0))
+        keep_blocks = usable & (block_var >= max(6.0, var_cut))
+        keep = np.zeros((h2 // block, w2 // block, block, block), dtype=bool)
+        keep[keep_blocks] = True
+        texture = np.zeros_like(body_mask, dtype=bool)
+        texture[:h2, :w2] = keep.reshape(h2, w2)
+        texture &= body_mask
+        if float(np.mean(texture)) < 0.04:
+            return body_mask
+        return texture
+
+    def _af_atlas_score(self, roi_raw):
+        """ATLAS Focus score: texture-guided multi-scale Tenengrad/Laplacian/Brenner fusion."""
+        import numpy as np
+
+        if roi_raw is None or roi_raw.size < 16:
+            return 0.0
+
+        roi_f = self._normalize_gray_for_analysis(roi_raw)
+        if roi_f.shape[0] < 3 or roi_f.shape[1] < 3:
+            return float(np.var(roi_f))
+
+        p02 = float(np.percentile(roi_f, 2.0))
+        p10 = float(np.percentile(roi_f, 10.0))
+        p50 = float(np.percentile(roi_f, 50.0))
+        p90 = float(np.percentile(roi_f, 90.0))
+        p98 = float(np.percentile(roi_f, 98.0))
+        contrast = p90 - p10
+        if contrast < 8.0:
+            return 0.0
+
+        body_low = max(p02 + 6.0, p50 - 55.0)
+        body_high = min(p98 - 10.0, p50 + 85.0, 238.0)
+        body_mask = (roi_f >= body_low) & (roi_f <= body_high)
+        if float(np.mean(body_mask)) < 0.18:
+            body_mask = (roi_f >= p10) & (roi_f <= min(p98, 242.0))
+        body_mask &= roi_f < 248.0
+
+        texture_mask = self._af_texture_mask(roi_f, body_mask)
+        if int(np.count_nonzero(texture_mask)) < 64:
+            return 0.0
+
+        grad2, lap2, brenner = self._af_focus_components(roi_f)
+        smooth = self._af_smooth3(roi_f)
+        grad2_smooth, _, _ = self._af_focus_components(smooth)
+
+        tenengrad_hi = float(np.percentile(grad2[texture_mask], 92.0))
+        tenengrad_smooth_hi = float(np.percentile(grad2_smooth[texture_mask], 92.0))
+        lap_hi = float(np.percentile(lap2[texture_mask], 92.0))
+        brenner_hi = float(np.percentile(brenner[texture_mask], 92.0))
+
+        local_values = roi_f[texture_mask]
+        local_contrast = float(np.percentile(local_values, 90.0) - np.percentile(local_values, 10.0))
+        highlight_penalty = 1.0 / (1.0 + max(0.0, float(np.mean(roi_f >= 248.0)) - 0.003) * 80.0)
+        contrast_weight = max(0.15, min(1.0, local_contrast / 80.0))
+        coverage_weight = max(0.45, min(1.0, float(np.mean(texture_mask)) / 0.18))
+
+        fused = (
+            0.45 * tenengrad_hi
+            + 0.25 * tenengrad_smooth_hi
+            + 0.20 * lap_hi
+            + 0.10 * brenner_hi
+        )
+        return float(fused * contrast_weight * coverage_weight * highlight_penalty)
+
     def _compute_roi_contrast(self, cx, cy, half=25, sample_count=1):
-        """Contrast-based focus score (Laplacian variance) in a 50×50 ROI at image coords (cx, cy)."""
+        """ATLAS ROI focus score around a double-clicked image point."""
         import numpy as np
 
         scores = []
@@ -483,17 +607,7 @@ class MainWindow(QMainWindow):
             roi = gray[y1:y2, x1:x2]
             if roi.size < 16:
                 continue
-            roi_f = self._normalize_gray_for_analysis(roi)
-            if roi_f.shape[0] < 3 or roi_f.shape[1] < 3:
-                scores.append(float(np.var(roi_f)))
-                continue
-            # Laplacian variance: classic contrast-based focus measure
-            lap = (
-                roi_f[:-2, 1:-1] + roi_f[2:, 1:-1]
-                + roi_f[1:-1, :-2] + roi_f[1:-1, 2:]
-                - 4.0 * roi_f[1:-1, 1:-1]
-            )
-            scores.append(float(np.var(lap)))
+            scores.append(self._af_atlas_score(roi))
             if sample_count > 1:
                 time.sleep(0.04)
         if not scores:
@@ -601,7 +715,7 @@ class MainWindow(QMainWindow):
     def _compute_sharpness(self, sample_count=1, roi_fraction=0.65):
         import numpy as np
 
-        # When a ROI center has been set by double-click, use contrast-based focus score
+        # When a ROI center has been set by double-click, score only that local target.
         if self._af_roi_center is not None:
             cx, cy = self._af_roi_center
             return self._compute_roi_contrast(cx, cy, half=25, sample_count=sample_count)
@@ -611,52 +725,7 @@ class MainWindow(QMainWindow):
             roi_raw = self._get_center_roi(roi_fraction=roi_fraction)
             if roi_raw is None:
                 continue
-            # 仅做位深归一化到 8-bit，不做局部对比度均衡化
-            # 均衡化会把离焦产生的干涉条纹拉伸成"高梯度"，导致误判为焦点
-            roi_f = self._normalize_gray_for_analysis(roi_raw)
-            p02 = float(np.percentile(roi_f, 2.0))
-            p10 = float(np.percentile(roi_f, 10.0))
-            p50 = float(np.percentile(roi_f, 50.0))
-            p90 = float(np.percentile(roi_f, 90.0))
-            p98 = float(np.percentile(roi_f, 98.0))
-            contrast = p90 - p10
-            if contrast < 8.0:
-                scores.append(0.0)
-                continue
-
-            # 牙体是半透明且强反光的目标，高光点和背景纤维会误导普通全局锐度。
-            # 这里仅保留中间亮度的主体像素，并用高分位梯度强调真实纹理/沟槽。
-            body_low = max(p02 + 6.0, p50 - 55.0)
-            body_high = min(p98 - 10.0, p50 + 85.0, 238.0)
-            mask = (roi_f >= body_low) & (roi_f <= body_high)
-            if float(np.mean(mask)) < 0.18:
-                mask = (roi_f >= p10) & (roi_f <= min(p98, 242.0))
-
-            gx = np.zeros_like(roi_f, dtype=np.float32)
-            gy = np.zeros_like(roi_f, dtype=np.float32)
-            gx[:, 1:-1] = roi_f[:, 2:] - roi_f[:, :-2]
-            gy[1:-1, :] = roi_f[2:, :] - roi_f[:-2, :]
-            grad2 = gx * gx + gy * gy
-            lap = np.zeros_like(roi_f, dtype=np.float32)
-            lap[1:-1, 1:-1] = (
-                roi_f[:-2, 1:-1]
-                + roi_f[2:, 1:-1]
-                + roi_f[1:-1, :-2]
-                + roi_f[1:-1, 2:]
-                - 4.0 * roi_f[1:-1, 1:-1]
-            )
-            valid_grad = grad2[mask]
-            valid_lap = (lap * lap)[mask]
-            if valid_grad.size < 64:
-                scores.append(0.0)
-                continue
-
-            tenengrad_hi = float(np.percentile(valid_grad, 92.0))
-            lap_hi = float(np.percentile(valid_lap, 92.0))
-            local_contrast = float(np.percentile(roi_f[mask], 90.0) - np.percentile(roi_f[mask], 10.0))
-            highlight_penalty = 1.0 / (1.0 + max(0.0, float(np.mean(roi_f >= 248.0)) - 0.003) * 80.0)
-            contrast_weight = max(0.15, min(1.0, local_contrast / 80.0))
-            scores.append((0.65 * tenengrad_hi + 0.35 * lap_hi) * contrast_weight * highlight_penalty)
+            scores.append(self._af_atlas_score(roi_raw))
             if sample_count > 1:
                 time.sleep(0.04)
         if not scores:
@@ -913,6 +982,21 @@ class MainWindow(QMainWindow):
             return int(best_local_idx)
         return best_idx
 
+    @staticmethod
+    def _af_peak_confidence(scores, best_idx):
+        import numpy as np
+
+        arr = np.asarray(scores, dtype=np.float32)
+        if arr.size < 3:
+            return 1.0
+        best = max(float(arr[best_idx]), 1e-6)
+        distances = np.abs(np.arange(arr.size) - int(best_idx))
+        side = arr[distances >= 2]
+        if side.size == 0:
+            side = np.delete(arr, int(best_idx))
+        baseline = max(float(np.median(side)), 1e-6)
+        return best / baseline
+
     def _af_scan_window(self, start_pos, end_pos, step, label, accumulated, set_status, sample_count=1):
         import numpy as np
 
@@ -938,6 +1022,52 @@ class MainWindow(QMainWindow):
 
         return np.asarray(positions, dtype=np.float32), np.asarray(scores, dtype=np.float32), accumulated
 
+    def _af_adaptive_refine(self, center_pos, accumulated, set_status):
+        import numpy as np
+
+        current_center = float(center_pos)
+        all_positions = []
+        all_scores = []
+        step_plan = [
+            (0.180, 0.030, 1),
+            (0.075, 0.015, 1),
+            (0.032, 0.008, 2),
+            (0.016, 0.004, 2),
+        ]
+
+        for round_idx, (span, step, sample_count) in enumerate(step_plan, start=1):
+            if not self.autofocus_running:
+                set_status("已停止")
+                return None, None, accumulated
+
+            positions, scores, accumulated = self._af_scan_window(
+                current_center - span,
+                current_center + span,
+                step,
+                "ATLAS精扫{}  步长{:.3f}mm".format(round_idx, step),
+                accumulated,
+                set_status,
+                sample_count=sample_count,
+            )
+            if scores is None:
+                return None, None, accumulated
+
+            all_positions.extend([float(pos) for pos in positions])
+            all_scores.extend([float(score) for score in scores])
+            best_idx = self._af_pick_best_index(scores)
+            current_center = self._af_quadratic_peak(positions, scores, best_idx)
+
+            if float(np.max(scores)) <= 0.0:
+                break
+
+        if not all_scores:
+            return None, None, accumulated
+
+        all_positions = np.asarray(all_positions, dtype=np.float32)
+        all_scores = np.asarray(all_scores, dtype=np.float32)
+        order = np.argsort(all_positions)
+        return all_positions[order], all_scores[order], accumulated
+
     def _autofocus_worker(self):
         import numpy as np
 
@@ -950,7 +1080,7 @@ class MainWindow(QMainWindow):
             accumulated = 0.0
             coarse_step = 0.20
             coarse_positions, coarse_scores, accumulated = self._af_scan_window(
-                -1.0, 1.0, coarse_step, "对焦中… 粗扫", accumulated, set_status, sample_count=1
+                -1.0, 1.0, coarse_step, "ATLAS粗扫", accumulated, set_status, sample_count=1
             )
             if coarse_scores is None:
                 return
@@ -963,7 +1093,7 @@ class MainWindow(QMainWindow):
                 ext_start = float(coarse_positions[best_idx] + direction * 0.4)
                 ext_end = float(coarse_positions[best_idx] + direction * 2.2)
                 ext_positions, ext_scores, accumulated = self._af_scan_window(
-                    ext_start, ext_end, 0.4 * direction, "对焦中… 扩展粗扫", accumulated, set_status, sample_count=1
+                    ext_start, ext_end, 0.4 * direction, "ATLAS扩展粗扫", accumulated, set_status, sample_count=1
                 )
                 if ext_scores is not None and len(ext_scores) > 0:
                     all_positions = np.concatenate([coarse_positions, ext_positions])
@@ -979,25 +1109,14 @@ class MainWindow(QMainWindow):
                 return
             accumulated = coarse_peak
 
-            # Phase 2: 精扫 ±0.25mm / 0.025mm 步 → 21 个位置 + 二次拟合
-            # 粗扫步长 0.2mm，最大误差 ±0.1mm，精扫范围 ±0.25mm 足够覆盖
-            fine_range = 0.22
-            fine_step = 0.030
-            fine_positions, fine_scores, accumulated = self._af_scan_window(
-                coarse_peak - fine_range,
-                coarse_peak + fine_range,
-                fine_step,
-                "对焦中… 精扫",
-                accumulated,
-                set_status,
-                sample_count=1,
-            )
+            fine_positions, fine_scores, accumulated = self._af_adaptive_refine(coarse_peak, accumulated, set_status)
             if fine_scores is None:
                 return
             best_idx_f = self._af_pick_best_index(fine_scores)
             best_fine_pos = self._af_quadratic_peak(fine_positions, fine_scores, best_idx_f)
             best_measured_pos = float(fine_positions[best_idx_f])
             best_measured_score = float(fine_scores[best_idx_f])
+            confidence = self._af_peak_confidence(fine_scores, best_idx_f)
 
             if not self._af_move_z(best_fine_pos - accumulated):
                 set_status("对焦失败：串口错误")
@@ -1012,7 +1131,14 @@ class MainWindow(QMainWindow):
                 if self._af_move_z(best_measured_pos - best_fine_pos):
                     best_fine_pos = best_measured_pos
                     final_score = self._compute_sharpness(sample_count=2, roi_fraction=0.72)
-            set_status("对焦完成 ✓  位置偏移:{:+.3f}mm  锐度:{:.0f}".format(best_fine_pos, final_score))
+            if best_measured_score <= 0.0:
+                set_status("对焦失败：有效纹理不足，请调整光照或样品位置")
+            elif confidence < 1.06:
+                set_status("ATLAS完成 △ 峰值不明显  位置偏移:{:+.3f}mm  锐度:{:.0f}  置信:{:.2f}".format(
+                    best_fine_pos, final_score, confidence))
+            else:
+                set_status("ATLAS完成 ✓  位置偏移:{:+.3f}mm  锐度:{:.0f}  置信:{:.2f}".format(
+                    best_fine_pos, final_score, confidence))
         except Exception as exc:
             set_status("对焦失败: " + str(exc))
         finally:
