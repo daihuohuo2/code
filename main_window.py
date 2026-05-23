@@ -15,7 +15,7 @@ from algorithms import (
 )
 from config_manager import ConfigManager
 from device_controller import DeviceController, SERIAL_AVAILABLE, to_hex_str
-from dialogs import PointCloudReconDialog, TemporalDepthDialog, OneClickDialog, ProgrammableShootingDialog
+from dialogs import PointCloudReconDialog, TemporalDepthDialog, OneClickDialog, ProgrammableShootingDialog, OfflineZStackDialog
 from overlays import DoubleClickFilter, ResizeFilter, ScaleBarOverlay
 from ui import Ui_MainWindow
 
@@ -49,6 +49,7 @@ class MainWindow(QMainWindow):
         self._temporal_depth_dialog = None
         self._one_click_dialog = None
         self._programmable_dialog = None
+        self._offline_zstack_dialog = None
         self._cleaned_up = False
         self._z_poll_busy = False
 
@@ -121,6 +122,8 @@ class MainWindow(QMainWindow):
 
         action_prog = menubar.addAction("可编程拍摄(&P)")
         action_prog.triggered.connect(self.open_programmable_shooting_dialog)
+        action_offline = menubar.addAction("Offline Z-stack (&Z)...")
+        action_offline.triggered.connect(self.open_offline_zstack_dialog)
 
     def load_settings(self):
         config = self.config_manager.load()
@@ -1249,6 +1252,13 @@ class MainWindow(QMainWindow):
         self._programmable_dialog.show()
         self._programmable_dialog.raise_()
         self._programmable_dialog.activateWindow()
+
+    def open_offline_zstack_dialog(self):
+        if self._offline_zstack_dialog is None:
+            self._offline_zstack_dialog = OfflineZStackDialog(self.config_manager, self)
+        self._offline_zstack_dialog.show()
+        self._offline_zstack_dialog.raise_()
+        self._offline_zstack_dialog.activateWindow()
 
     def enable_controls(self):
         is_open = self.device_controller.opened

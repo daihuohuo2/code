@@ -1382,6 +1382,7 @@ def save_output_bundle(
         "folder": folder_name,
         "generator": comment,
         "parameters": _json_safe(params or {}),
+        "z_positions_mm": _json_safe(z_positions if z_positions is not None else []),
         "units": {
             "depth_tiff_pixel_value": "relative_height_um",
             "point_cloud_coordinates": "mm",
