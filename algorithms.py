@@ -882,6 +882,97 @@ def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
 
+def save_autofocus_curve(output_path, samples, title="自动对焦锐度曲线"):
+    """Save autofocus Z/score samples as a PNG curve."""
+    import numpy as np
+
+    if not samples:
+        return None
+
+    z_values = np.asarray([float(item["z_mm"]) for item in samples], dtype=np.float32)
+    scores = np.asarray([float(item["score"]) for item in samples], dtype=np.float32)
+    phases = [str(item.get("phase", "")) for item in samples]
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+
+    font_prop = get_mpl_font()
+    fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=160)
+
+    order = np.argsort(z_values)
+    ax.plot(
+        z_values[order],
+        scores[order],
+        color="#1f77b4",
+        linewidth=1.8,
+        alpha=0.72,
+        label="Z-sorted curve",
+    )
+
+    phase_order = []
+    for phase in phases:
+        if phase not in phase_order:
+            phase_order.append(phase)
+    colors = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#17becf"]
+    for idx, phase in enumerate(phase_order):
+        mask = np.asarray([p == phase for p in phases], dtype=bool)
+        label = phase or "sample"
+        ax.scatter(
+            z_values[mask],
+            scores[mask],
+            s=24,
+            color=colors[idx % len(colors)],
+            edgecolors="white",
+            linewidths=0.6,
+            label=label,
+            zorder=3,
+        )
+
+    if scores.size:
+        best_idx = int(np.argmax(scores))
+        ax.axvline(float(z_values[best_idx]), color="#d62728", linestyle="--", linewidth=1.2, alpha=0.65)
+        ax.annotate(
+            "Best Z {:+.3f} mm\nScore {:.0f}".format(float(z_values[best_idx]), float(scores[best_idx])),
+            xy=(float(z_values[best_idx]), float(scores[best_idx])),
+            xytext=(10, 12),
+            textcoords="offset points",
+            fontsize=9,
+            fontproperties=font_prop,
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#d62728", alpha=0.88),
+        )
+
+    ax.set_xlabel("Z 偏移 (mm)", fontproperties=font_prop)
+    ax.set_ylabel("锐度分数", fontproperties=font_prop)
+    ax.set_title(title, fontproperties=font_prop)
+    ax.grid(True, alpha=0.28)
+    ax.legend(loc="best", fontsize=8, prop=font_prop)
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def save_autofocus_curve_csv(output_path, samples):
+    if not samples:
+        return None
+    with open(output_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["sample_index", "phase", "z_offset_mm", "sharpness_score"])
+        for index, item in enumerate(samples):
+            writer.writerow([
+                index,
+                str(item.get("phase", "")),
+                float(item["z_mm"]),
+                float(item["score"]),
+            ])
+    return output_path
+
+
 def save_composite_image(intensity_map, file_path):
     """将 float32 灰度强度图保存为图像文件（BMP / PNG / TIFF）。
     优先用 cv2.imwrite()，其次 PyQt5 QImage.save()，失败则退化为纯 Python 写入。

@@ -12,6 +12,8 @@ from algorithms import (
     compute_blob_scale_calibration,
     ensure_dir,
     phase_correlation_shift,
+    save_autofocus_curve,
+    save_autofocus_curve_csv,
 )
 from config_manager import ConfigManager
 from device_controller import DeviceController, SERIAL_AVAILABLE, to_hex_str
@@ -45,6 +47,8 @@ class MainWindow(QMainWindow):
         self._cam_img_width = 0
         self._cam_img_height = 0
         self._af_roi_center = None   # (img_cx, img_cy) set by double-click; None = global focus
+        self._af_curve_samples = []
+        self._last_af_curve_paths = {}
         self._recon3d_dialog = None
         self._temporal_depth_dialog = None
         self._one_click_dialog = None
@@ -125,6 +129,8 @@ class MainWindow(QMainWindow):
         action_prog.triggered.connect(self.open_programmable_shooting_dialog)
         action_offline = menubar.addAction("Offline Z-stack (&Z)...")
         action_offline.triggered.connect(self.open_offline_zstack_dialog)
+        action_af_curve = menubar.addAction("导出自动对焦锐度曲线(&F)...")
+        action_af_curve.triggered.connect(self.export_last_autofocus_curve)
 
     def load_settings(self):
         config = self.config_manager.load()
@@ -1018,6 +1024,7 @@ class MainWindow(QMainWindow):
             score = self._compute_sharpness(sample_count=sample_count)
             positions.append(accumulated)
             scores.append(score)
+            self._record_af_curve_sample(label, accumulated, score)
             set_status("{} {}/{}  Z{:+.3f}  锐度:{:.0f}".format(label, i + 1, count, accumulated, score))
             if i < count - 1:
                 if not self._af_move_z(step):
@@ -1025,6 +1032,60 @@ class MainWindow(QMainWindow):
                 accumulated += step
 
         return np.asarray(positions, dtype=np.float32), np.asarray(scores, dtype=np.float32), accumulated
+
+    def _record_af_curve_sample(self, phase, z_mm, score):
+        phase_name = str(phase).split()[0] if phase else "AF"
+        self._af_curve_samples.append({
+            "phase": phase_name,
+            "z_mm": float(z_mm),
+            "score": float(score),
+        })
+
+    def _save_autofocus_curve_outputs(self):
+        samples = list(self._af_curve_samples)
+        if not samples:
+            return {}
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(self.config_manager.effective_save_path(), "autofocus_curves")
+        ensure_dir(output_dir)
+        base_name = "autofocus_sharpness_curve_{}".format(timestamp)
+        png_path = os.path.join(output_dir, base_name + ".png")
+        csv_path = os.path.join(output_dir, base_name + ".csv")
+        saved = {}
+        try:
+            if save_autofocus_curve(png_path, samples):
+                saved["png"] = png_path
+        except Exception:
+            pass
+        try:
+            if save_autofocus_curve_csv(csv_path, samples):
+                saved["csv"] = csv_path
+        except Exception:
+            pass
+        self._last_af_curve_paths = saved
+        return saved
+
+    def export_last_autofocus_curve(self):
+        if not self._af_curve_samples:
+            QMessageBox.information(self, "提示", "还没有自动对焦锐度数据，请先运行一次自动对焦。", QMessageBox.Ok)
+            return
+        default_name = "autofocus_sharpness_curve_{}.png".format(datetime.now().strftime("%Y%m%d_%H%M%S"))
+        default_path = os.path.join(self.config_manager.effective_save_path(), default_name)
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出自动对焦锐度曲线",
+            default_path,
+            "PNG 图片 (*.png);;所有文件 (*.*)",
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".png"):
+            file_path += ".png"
+        try:
+            save_autofocus_curve(file_path, self._af_curve_samples)
+            QMessageBox.information(self, "完成", "自动对焦锐度曲线已导出：\n{}".format(file_path), QMessageBox.Ok)
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", str(exc), QMessageBox.Ok)
 
     def _af_adaptive_refine(self, center_pos, accumulated, set_status):
         import numpy as np
@@ -1079,6 +1140,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda m=message: self.ui.lblAutoFocusStatus.setText(m))
 
         try:
+            self._af_curve_samples = []
+            self._last_af_curve_paths = {}
             # Phase 1a: 窄范围快速粗扫 ±0.8mm / 0.2mm 步 → 9 个位置
             # 样品通常已接近焦点，大多数情况这一阶段即可定位
             accumulated = 0.0
@@ -1135,14 +1198,27 @@ class MainWindow(QMainWindow):
                 if self._af_move_z(best_measured_pos - best_fine_pos):
                     best_fine_pos = best_measured_pos
                     final_score = self._compute_sharpness(sample_count=2, roi_fraction=0.72)
+            self._record_af_curve_sample("最终确认", best_fine_pos, final_score)
             if best_measured_score <= 0.0:
-                set_status("对焦失败：有效纹理不足，请调整光照或样品位置")
+                status_msg = "对焦失败：有效纹理不足，请调整光照或样品位置"
+                saved = self._save_autofocus_curve_outputs()
+                if saved.get("png"):
+                    status_msg += "  曲线: {}".format(saved["png"])
+                set_status(status_msg)
             elif confidence < 1.06:
-                set_status("ATLAS完成 △ 峰值不明显  位置偏移:{:+.3f}mm  锐度:{:.0f}  置信:{:.2f}".format(
-                    best_fine_pos, final_score, confidence))
+                status_msg = "ATLAS完成 △ 峰值不明显  位置偏移:{:+.3f}mm  锐度:{:.0f}  置信:{:.2f}".format(
+                    best_fine_pos, final_score, confidence)
+                saved = self._save_autofocus_curve_outputs()
+                if saved.get("png"):
+                    status_msg += "  曲线: {}".format(saved["png"])
+                set_status(status_msg)
             else:
-                set_status("ATLAS完成 ✓  位置偏移:{:+.3f}mm  锐度:{:.0f}  置信:{:.2f}".format(
-                    best_fine_pos, final_score, confidence))
+                status_msg = "ATLAS完成 ✓  位置偏移:{:+.3f}mm  锐度:{:.0f}  置信:{:.2f}".format(
+                    best_fine_pos, final_score, confidence)
+                saved = self._save_autofocus_curve_outputs()
+                if saved.get("png"):
+                    status_msg += "  曲线: {}".format(saved["png"])
+                set_status(status_msg)
         except Exception as exc:
             set_status("对焦失败: " + str(exc))
         finally:
