@@ -1190,11 +1190,14 @@ def _draw_scale_bar_on_array(arr, pixels_per_mm):
 
     bar_len_px = max(4, int(round(w * 0.20)))
     bar_len_mm = bar_len_px / float(pixels_per_mm)
-    # Label: use μm when < 1 mm, otherwise mm
-    if bar_len_mm < 1.0:
-        label = "{:.0f} um".format(bar_len_mm * 1000)
+    # Keep the displayed unit in micrometers so the fixed-width bar only changes value.
+    bar_len_um = bar_len_mm * 1000.0
+    if bar_len_um < 10.0:
+        label = "{:.2f} um".format(bar_len_um)
+    elif bar_len_um < 100.0:
+        label = "{:.1f} um".format(bar_len_um)
     else:
-        label = "{:.2f} mm".format(bar_len_mm).rstrip("0").rstrip(".") + " mm"
+        label = "{:.0f} um".format(bar_len_um)
 
     try:
         import cv2 as _cv2

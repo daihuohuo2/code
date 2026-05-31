@@ -216,12 +216,11 @@ class MainWindow(QMainWindow):
             if mag is None or mag <= 0:
                 return
             curve_ppmm = self._lookup_curve_pixels_per_mm(mag)
-            ppmm = curve_ppmm * self.config_manager.scale_curve_factor
             self.config_manager.magnification = mag
-            self._set_pixels_per_mm(ppmm)
+            self._set_pixels_per_mm(curve_ppmm)
             self.save_settings()
             self.ui.lblQuickScaleStatus.setText(
-                "倍率 {:.2f}x → {:.2f} px/mm".format(mag, ppmm)
+                "倍率 {:.2f}x → {:.2f} px/mm".format(mag, curve_ppmm)
             )
         except Exception as exc:
             self.ui.lblQuickScaleStatus.setText("倍率换算失败: " + str(exc))
@@ -731,16 +730,15 @@ class MainWindow(QMainWindow):
 
     def _on_quick_scale_done(self, result):
         try:
-            ppmm = result["pixels_per_mm"]
+            measured_ppmm = result["pixels_per_mm"]
             mag = self._current_magnification()
-            curve_factor = None
+            curve_ppmm = None
             if mag is not None and mag > 0:
                 curve_ppmm = self._lookup_curve_pixels_per_mm(mag)
-                if curve_ppmm > 0:
-                    curve_factor = ppmm / curve_ppmm
-                    self.config_manager.magnification = mag
-                    self.config_manager.scale_curve_factor = curve_factor
-            self._set_pixels_per_mm(ppmm)
+                self.config_manager.magnification = mag
+                self._set_pixels_per_mm(curve_ppmm)
+            else:
+                self._set_pixels_per_mm(measured_ppmm)
             self.save_settings()
             self.ui.chkShowScaleBar.setChecked(True)
             self.scale_overlay.set_visible(True)
@@ -753,8 +751,9 @@ class MainWindow(QMainWindow):
             status = "完成 ✓ {}点 | {:.2f}px≈{}µm".format(
                 result["blob_count"], result["spacing_px"], int(spacing_um)
             )
-            if curve_factor is not None:
-                status += " | 倍率曲线修正 {:.4f}x".format(curve_factor)
+            if curve_ppmm is not None:
+                status += " | 已保持倍率 {:.2f}x = {:.2f} px/mm".format(mag, curve_ppmm)
+                status += " | 本次测得 {:.2f} px/mm".format(measured_ppmm)
             self.ui.lblQuickScaleStatus.setText(status)
         except Exception as e:
             self.ui.lblQuickScaleStatus.setText("UI更新失败: " + str(e))
