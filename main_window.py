@@ -1046,7 +1046,7 @@ class MainWindow(QMainWindow):
         if not samples:
             return {}
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = os.path.join(self.config_manager.effective_save_path(), "autofocus_curves")
+        output_dir = self.config_manager.effective_save_path()
         ensure_dir(output_dir)
         base_name = "autofocus_sharpness_curve_{}".format(timestamp)
         png_path = os.path.join(output_dir, base_name + ".png")
